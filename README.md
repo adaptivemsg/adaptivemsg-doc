@@ -17,7 +17,7 @@ on the wire. No IDL files are required.
   - Runtime + macros.
 - `adaptivemsg-go`
   - Go runtime.
-- `adaptivemsg-gen`
+- `amgen`
   - Bi-directional generator (Rust <-> Go).
 - `adaptivemsg-doc`
   - This proposal.
@@ -212,41 +212,12 @@ If an override is set, it replaces the default.
 
 ## Code generation (no IDL)
 
-`adaptivemsg-gen` supports both directions with explicit choice:
+`amgen` generates bindings directly from source (no schema files). It uses the
+message name rule (or override) and preserves field order for compact mode.
 
-- `adaptivemsg-gen --from rust --to go` -> generate Go structs + tags
-- `adaptivemsg-gen --from go --to rust` -> generate Rust structs + tags
-
-Generator uses the message name rule (or override) and preserves field order
-for compact mode.
-
-### Example: Rust server -> Go clients
-
-Repo layout:
-
-```
-rust-server/
-  Cargo.toml
-  src/
-    message.rs      # #[message] structs live here
-    server.rs
-  go/
-    go.mod          # module path for generated Go
-    message.go      # generated output
-```
-
-Command:
-
-```
-adaptivemsg-gen --from rust --to go --input ./src/message.rs --out ./go/message.go
-```
-
-Go client usage:
-
-```
-import "rust-server/go"
-// use rust-server/go.MessageRequest, etc.
-```
+- Go -> Rust: parse `message.go`, emit a `message.rs` file (default) and a
+  repo-root `Cargo.toml` that points its library to that file.
+- Rust -> Go: planned (same tool name).
 
 ### Example: Go server -> Rust clients
 
@@ -255,24 +226,36 @@ Repo layout:
 ```
 go-server/
   go.mod
+  Cargo.toml      # generated Rust crate (repo root)
   message/
-    message.go      # Go message structs
-  rust/
-    Cargo.toml      # generated Rust crate
-    src/
-      message.rs    # generated output
+    message.go      # Go message structs (source of truth)
+    message.rs      # generated Rust output
+```
+
+Add a generator hook in `message.go`:
+
+```
+//go:generate go run <module>/cmd/amgen --in=./message.go --out=./message.rs
 ```
 
 Command:
 
 ```
-adaptivemsg-gen --from go --to rust --input ./message --out ./rust
+go generate ./...
 ```
 
-Rust client usage:
+Note: install `amgen` or invoke it via `go run <module>/cmd/amgen` before running `go generate`.
+`amgen` refuses to overwrite an existing repo-root `Cargo.toml`.
+The generated `Cargo.toml` sets `[lib] path` to the `message.rs` location and includes a placeholder
+`adaptivemsg` dependency; fill it with a path or git source.
+
+Rust client usage (recommended):
 
 ```
-use go_server_messages::MessageRequest;
+// Cargo.toml
+[dependencies]
+hello = { path = "../go-server" }
+# hello = { git = "https://github.com/you/go-server", package = "hello" }
 ```
 
 ## Compatibility rules
@@ -284,5 +267,5 @@ use go_server_messages::MessageRequest;
 ## Next steps
 
 1) Define the namespace string.
-2) Implement `adaptivemsg-gen` with Rust->Go and Go->Rust.
+2) Implement `amgen` for Rust->Go (Go->Rust is the initial focus).
 3) Maintain Rust parity with the Go runtime (msgpack codecs + handshake already implemented in Go).
