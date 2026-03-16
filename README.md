@@ -118,7 +118,7 @@ Initial codecs:
 
 ### Codec selection & shared IDs
 
-- The client sends an ordered preference list; the server picks the first codec it also supports.
+- The client sends an ordered preference list; the server picks the first codec it also supports (compact-first by default in current runtimes).
 - Cross-language interop (go↔rust) requires a shared `CodecID` mapping and matching envelope semantics.
 - Each runtime may support extra codecs, but only shared codecs can be negotiated successfully.
 - Always include a shared fallback codec to avoid no-common-codec failures.
@@ -159,6 +159,9 @@ These are suitable for Rust↔Rust only (not cross-language unless Go matches th
 - `32–63`: shared custom codecs (must be documented in adaptivemsg-doc).
 - `64–127`: implementation-specific (Go-only/Rust-only).
 - `128–255`: reserved for future expansion.
+
+Assigned implementation-specific IDs:
+- `64` = Postcard (Rust-only, envelope `{type, data}`).
 
 ### Compact (array, order-dependent)
 
