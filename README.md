@@ -1,3 +1,29 @@
+- [adaptivemsg proposal (doc-only)](#adaptivemsg-proposal-doc-only)
+  - [Goals](#goals)
+  - [Repo split](#repo-split)
+  - [Rust implementations](#rust-implementations)
+  - [Go implementations](#go-implementations)
+  - [Examples](#examples)
+  - [Language parity](#language-parity)
+  - [Wire protocol](#wire-protocol)
+    - [Handshake (per connection, v2)](#handshake-per-connection-v2)
+    - [Frame header (all modes)](#frame-header-all-modes)
+    - [Optional per-frame meta (internal-only)](#optional-per-frame-meta-internal-only)
+  - [Codecs (pluggable)](#codecs-pluggable)
+    - [Codec selection \& shared IDs](#codec-selection--shared-ids)
+    - [Shared codec candidates](#shared-codec-candidates)
+    - [Go-only performance codecs](#go-only-performance-codecs)
+    - [Rust-only performance codecs](#rust-only-performance-codecs)
+    - [CodecID registry (proposal)](#codecid-registry-proposal)
+    - [Compact (array, order-dependent)](#compact-array-order-dependent)
+    - [Map (field names, order-independent)](#map-field-names-order-independent)
+  - [Message naming rule](#message-naming-rule)
+    - [Explicit override](#explicit-override)
+  - [Code generation (no IDL)](#code-generation-no-idl)
+    - [Example: Go server -\> Rust clients](#example-go-server---rust-clients)
+  - [Compatibility rules](#compatibility-rules)
+  - [Next steps](#next-steps)
+
 # adaptivemsg proposal (doc-only)
 
 This document describes the clean "from scratch" wire protocol for a shared
@@ -23,6 +49,25 @@ on the wire. No IDL files are required.
   - Rust -> Go generator (install with `cargo install adaptivemsg-amgen`).
 - `adaptivemsg-doc`
   - This proposal.
+
+## Rust implementations
+
+- `adaptivemsg-rust`: runtime + macros (crate name `adaptivemsg`).
+- `adaptivemsg-macros`: proc-macro crate for `#[am::message]` and `#[am::message_handler]`.
+- `adaptivemsg-amgen` (bin `amgen-rs`): Rust -> Go generator.
+
+## Go implementations
+
+- `adaptivemsg-go`: Go runtime.
+- `amgen-go`: Go -> Rust generator (via `go generate`).
+
+## Examples
+
+- `hello-server-go`: Go server using message api in `api/hello` (server build tag).
+- `hello-server-rust`: Rust server using message api in `api/hello`.
+- `hello-client-go`: Go client using Rust message api.
+- `hello-client-rust`: Rust client using Go message api.
+- Cross-lang tests pair Go client -> Rust server and Rust client -> Go server.
 
 ## Language parity
 
@@ -217,8 +262,11 @@ If an override is set, it replaces the default.
 `amgen-go` and `amgen-rs` generate bindings directly from source (no schema files). They use the
 message name rule (or override) and preserve field order for compact mode.
 
-- Go -> Rust: use `amgen-go` to parse `message.go`, emit a `message.rs` file (default) and a
-  repo-root `Cargo.toml` that points its library to that file.
+Recommended layout: keep shared message api under `api/<service>/` so the package/module leaf
+is stable across languages (example: `api/hello`).
+
+- Go -> Rust: use `amgen-go` to parse `api/<service>/message.go`, emit a `message.rs` file
+  alongside it and a repo-root `Cargo.toml` that points its library to that file.
 - Rust -> Go: use the Rust `amgen-rs` binary (install with `cargo install adaptivemsg-amgen`).
 
 ### Example: Go server -> Rust clients
@@ -228,13 +276,14 @@ Repo layout:
 ```
 go-server/
   go.mod
-  Cargo.toml      # generated Rust crate (repo root)
-  message/
-    message.go      # Go message structs (source of truth)
-    message.rs      # generated Rust output
+  Cargo.toml        # generated Rust crate (repo root)
+  api/
+    hello/
+      message.go      # Go message structs (source of truth)
+      message.rs      # generated Rust output
 ```
 
-Add a generator hook in `message.go`:
+Add a generator hook in `api/hello/message.go`:
 
 ```
 //go:generate go run <module>/cmd/amgen-go
@@ -262,8 +311,8 @@ hello = { path = "../go-server" }
 # hello = { git = "https://github.com/you/go-server", package = "hello" }
 ```
 
-For Rust -> Go generation, invoke `amgen-rs` from your Rust toolchain (often in `build.rs`)
-to regenerate Go structs from `message.rs` before consuming them in Go.
+For Rust -> Go generation, invoke `amgen-rs` from your Rust toolchain (or run it directly)
+to regenerate Go structs from `api/<service>/message.rs` before consuming them in Go.
 
 ## Compatibility rules
 
@@ -273,6 +322,6 @@ to regenerate Go structs from `message.rs` before consuming them in Go.
 
 ## Next steps
 
-1) Define the namespace string.
-2) Implement `amgen-rs` for Rust->Go (Go->Rust is the initial focus).
-3) Maintain Rust parity with the Go runtime (msgpack codecs + handshake already implemented in Go).
+1) Add CI for cross-lang tests (Go client -> Rust server, Rust client -> Go server).
+2) Expand generator parity and docs for `amgen-go` and `amgen-rs`.
+3) Maintain Rust/Go runtime parity (codecs + handshake + error semantics).
