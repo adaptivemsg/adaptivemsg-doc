@@ -17,8 +17,10 @@ on the wire. No IDL files are required.
   - Runtime + macros.
 - `adaptivemsg-go`
   - Go runtime.
-- `amgen`
-  - Bi-directional generator (Rust <-> Go).
+- `amgen-go`
+  - Go -> Rust generator (via `go generate`).
+- `amgen-rs`
+  - Rust -> Go generator (install with `cargo install adaptivemsg-amgen`).
 - `adaptivemsg-doc`
   - This proposal.
 
@@ -212,12 +214,12 @@ If an override is set, it replaces the default.
 
 ## Code generation (no IDL)
 
-`amgen` generates bindings directly from source (no schema files). It uses the
-message name rule (or override) and preserves field order for compact mode.
+`amgen-go` and `amgen-rs` generate bindings directly from source (no schema files). They use the
+message name rule (or override) and preserve field order for compact mode.
 
-- Go -> Rust: parse `message.go`, emit a `message.rs` file (default) and a
+- Go -> Rust: use `amgen-go` to parse `message.go`, emit a `message.rs` file (default) and a
   repo-root `Cargo.toml` that points its library to that file.
-- Rust -> Go: planned (same tool name).
+- Rust -> Go: use the Rust `amgen-rs` binary (install with `cargo install adaptivemsg-amgen`).
 
 ### Example: Go server -> Rust clients
 
@@ -235,7 +237,7 @@ go-server/
 Add a generator hook in `message.go`:
 
 ```
-//go:generate go run <module>/cmd/amgen --in=./message.go --out=./message.rs
+//go:generate go run <module>/cmd/amgen-go
 ```
 
 Command:
@@ -244,8 +246,10 @@ Command:
 go generate ./...
 ```
 
-Note: install `amgen` or invoke it via `go run <module>/cmd/amgen` before running `go generate`.
-`amgen` refuses to overwrite an existing repo-root `Cargo.toml`.
+Note: install `amgen-go` or invoke it via `go run <module>/cmd/amgen-go` before running `go generate`.
+`amgen-go` refuses to overwrite an existing repo-root `Cargo.toml`.
+`amgen-go` reads the `GOFILE` value provided by `go generate`, and writes a sibling `.rs`
+file using the same base name.
 The generated `Cargo.toml` sets `[lib] path` to the `message.rs` location and includes a placeholder
 `adaptivemsg` dependency; fill it with a path or git source.
 
@@ -258,6 +262,9 @@ hello = { path = "../go-server" }
 # hello = { git = "https://github.com/you/go-server", package = "hello" }
 ```
 
+For Rust -> Go generation, invoke `amgen-rs` from your Rust toolchain (often in `build.rs`)
+to regenerate Go structs from `message.rs` before consuming them in Go.
+
 ## Compatibility rules
 
 - Compact mode is order-sensitive: do not reorder fields across languages.
@@ -267,5 +274,5 @@ hello = { path = "../go-server" }
 ## Next steps
 
 1) Define the namespace string.
-2) Implement `amgen` for Rust->Go (Go->Rust is the initial focus).
+2) Implement `amgen-rs` for Rust->Go (Go->Rust is the initial focus).
 3) Maintain Rust parity with the Go runtime (msgpack codecs + handshake already implemented in Go).
