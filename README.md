@@ -8,6 +8,9 @@
   - [Wire protocol](#wire-protocol)
     - [Handshake (per connection, v2)](#handshake-per-connection-v2)
     - [Frame header (all modes)](#frame-header-all-modes)
+    - [Protocol v3 recovery mode](#protocol-v3-recovery-mode)
+    - [Attach and resume exchange (v3)](#attach-and-resume-exchange-v3)
+    - [Recovery control stream (v3)](#recovery-control-stream-v3)
     - [Optional per-frame meta (internal-only)](#optional-per-frame-meta-internal-only)
   - [Codecs (pluggable)](#codecs-pluggable)
     - [Codec selection \& shared IDs](#codec-selection--shared-ids)
@@ -22,6 +25,9 @@
   - [Code generation (no IDL)](#code-generation-no-idl)
     - [Example: Go server -\> Rust clients](#example-go-server---rust-clients)
   - [Compatibility rules](#compatibility-rules)
+  - [Observability and debuggability](#observability-and-debuggability)
+    - [Shared diagnostics model](#shared-diagnostics-model)
+    - [Shared failure-code vocabulary](#shared-failure-code-vocabulary)
   - [Next steps](#next-steps)
 
 # adaptivemsg proposal (doc-only)
@@ -136,6 +142,117 @@ Notes:
 - The payload bytes are encoded using the selected codec mode for that
   connection (compact or map).
 - `flags` are reserved; the current Go runtime ignores them.
+
+### Protocol v3 recovery mode
+
+Protocol `v3` extends the baseline protocol with transport recovery and replay.
+
+- `v2` is the legacy framing/behavior mode.
+- `v3` enables reconnect, attach/resume, per-connection sequencing, cumulative
+  ACK, and replay of unacknowledged outbound data frames.
+- Recovery scope is transport-only: it covers transport breakage while both
+  client and server processes remain alive.
+- Recovery does not cover process restart, node reboot, or durable replay after
+  process death.
+
+Shared recovery model:
+
+- one sequence space per direction per logical connection
+- cumulative ACK
+- replay of unacknowledged outbound data frames
+- reconnect owned by the dialing side
+- server-side detached logical connection retention with TTL/lease
+
+Current frame header layouts:
+
+```
+v2:
+[version(1) | flags(1) | stream_id(u32) | payload_len(u32)]
+
+v3:
+[version(1) | flags(1) | stream_id(u32) | payload_len(u32) | seq(u64)]
+```
+
+Notes:
+
+- `seq(u64)` is present only in `v3` data frames.
+- Control frames do not consume sequence numbers.
+- Sequence state is per connection, not per stream.
+
+### Attach and resume exchange (v3)
+
+After successful `v3` handshake, peers perform an attach/resume exchange before
+normal framed traffic begins.
+
+Attach request (44 bytes, big endian):
+
+```
+[mode(1) | reserved(3) | connection_id(16) | resume_secret(16) | last_recv_seq(u64)]
+```
+
+Attach response (60 bytes, big endian):
+
+```
+[status(1) | reserved(3) | connection_id(16) | resume_secret(16) |
+ last_recv_seq(u64) | ack_every(u32) | ack_delay_ms(u32) |
+ heartbeat_interval_ms(u32) | heartbeat_timeout_ms(u32)]
+```
+
+Field semantics:
+
+- `mode`: `new` or `resume`
+- `connection_id`: opaque logical connection identifier
+- `resume_secret`: resume authorization token
+- `last_recv_seq`: last sequence number fully received from the peer
+- `status`: `ok` or `rejected`
+
+Rules:
+
+- On first connect, client sends `new`; server assigns `connection_id` and
+  `resume_secret`.
+- On reconnect, client sends `resume`; server validates secret and detached
+  connection state.
+- Server responds with the last received peer sequence so replay can resume from
+  the correct position.
+- Server is authoritative for negotiated ACK and heartbeat policy values.
+
+### Recovery control stream (v3)
+
+`v3` reserves a control stream that is not exposed to user code.
+
+Reserved stream id:
+
+```
+control_stream_id = 0xFFFFFFFF
+```
+
+Current control payloads:
+
+- ACK: `type=1`, 9 bytes total
+
+```
+[1 | last_recv_seq(u64)]
+```
+
+- PING: `type=2`, 1 byte total
+
+```
+[2]
+```
+
+Current shared heartbeat model:
+
+- heartbeat is Ping-only
+- liveness is driven by read-timeout/deadline behavior
+- any valid inbound frame refreshes liveness: data, ACK, or PING
+- PONG is not part of the current protocol behavior
+
+Recovery delivery rules:
+
+- if inbound `seq == last_recv_seq + 1`, accept and deliver
+- if inbound `seq <= last_recv_seq`, treat as duplicate replay and drop
+- if inbound `seq > last_recv_seq + 1`, treat as protocol error
+- replay outbound frames with `seq > peer_last_recv_seq` after successful resume
 
 ### Optional per-frame meta (internal-only)
 
@@ -319,9 +436,78 @@ to regenerate Go structs from `api/<service>/message.rs` before consuming them i
 - Compact mode is order-sensitive: do not reorder fields across languages.
 - Map mode is order-agnostic: safe for reordering, but renames break.
 - Changing the message name breaks compatibility in both modes.
+- `v2` and `v3` are protocol-level compatibility boundaries; runtimes must agree
+  on version before framed traffic begins.
+- Wire protocol and recovery control formats are normative.
+- Debug APIs may differ by runtime, but failure-code meanings should remain
+  aligned across runtimes.
+
+## Observability and debuggability
+
+### Shared diagnostics model
+
+Runtimes should expose diagnostics in a scoped way rather than relying only on
+process-global counters.
+
+Recommended shared model:
+
+- per-connection diagnostics
+  - negotiated protocol version
+  - negotiated codec
+  - max frame
+  - scoped counters
+  - last failure code, reason, timestamp
+  - recovery state when enabled
+- per-stream diagnostics
+  - queue depth / timeout state where applicable
+  - scoped counters
+  - last failure code, reason, timestamp
+
+Recommended counter scope:
+
+- frames read/written
+- bytes read/written
+- messages sent/received
+- protocol errors
+- decode errors
+- handler calls/errors
+- reconnect attempts/successes/failures when recovery is enabled
+
+The exact API surface is runtime-specific, but the capability model should be
+shared so Go and Rust expose comparable operational signals.
+
+### Shared failure-code vocabulary
+
+Failure codes are intended for machine filtering, dashboards, and alerts.
+Human-readable detail should still be carried separately.
+
+Current shared vocabulary:
+
+- stream path
+  - `stream.recv_timeout`
+  - `stream.encode`
+  - `stream.enqueue`
+  - `stream.decode`
+  - `stream.protocol`
+  - `stream.protocol_reply_send`
+- connection path
+  - `connection.reader`
+  - `connection.writer`
+  - `connection.reader_enqueue`
+  - `handler.error`
+- recovery path
+  - `recovery.resume`
+  - `recovery.reconnect_terminal`
+  - `recovery.read`
+  - `recovery.control`
+  - `recovery.data`
+  - `recovery.ack_write`
+  - `recovery.resume_write`
+  - `recovery.live_write`
+  - `recovery.ping_write`
 
 ## Next steps
 
 1) Add CI for cross-lang tests (Go client -> Rust server, Rust client -> Go server).
 2) Expand generator parity and docs for `amgen-go` and `amgen-rs`.
-3) Maintain Rust/Go runtime parity (codecs + handshake + error semantics).
+3) Maintain Rust/Go runtime parity (codecs + handshake + recovery + error semantics).

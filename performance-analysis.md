@@ -136,6 +136,12 @@ AM_BENCH_ITERS=3000 cargo test --release --lib -- --ignored --nocapture benchmar
 
 # Single benchmark
 AM_BENCH_ITERS=3000 cargo test --release --lib -- --ignored --nocapture benchmark_protocol_v2_send_recv
+
+# Lower-noise run on a shared machine: serialize the Rust test harness, force a
+# single Tokio worker, pin to one CPU, and run the full protocol set in one
+# process.
+RUST_TEST_THREADS=1 TOKIO_WORKER_THREADS=1 AM_BENCH_RUNS=9 AM_BENCH_ITERS=8000 \
+  taskset -c 0 cargo test --release --lib -- --ignored --nocapture benchmark_protocol
 ```
 
 ### Rust: Recovery Runtime Micro-Benchmarks
@@ -198,41 +204,79 @@ V3 overhead:      +13.2%        +5.4%
 Go allocs:        V2 2338 B/op 64 allocs    V3 2439 B/op 66 allocs
 ```
 
-**Validation run** (2026-04-01, same CPU, 3 runs × 1000 ops, median):
+**Validation run** (2026-04-01, same CPU, apples-to-apples single-core setup):
 ```
-Go (go test -bench=BenchmarkProtocol -benchmem -count=3):
-  V2 SendRecv:       105,070 ns/op   2,338 B/op   64 allocs/op
-  V3 Recovery:       115,246 ns/op   2,438 B/op   66 allocs/op
-  V3 overhead:       +9.7%
+Go (GOMAXPROCS=1 taskset -c 0 go test -run '^$' \
+    -bench='BenchmarkProtocol(V2SendRecv|V3RecoverySendRecv)$' \
+    -benchmem -count=9 -benchtime=8000x . ; median reported below):
+  V2 SendRecv:       38,969 ns/op   2,336 B/op   64 allocs/op
+  V3 Recovery:       46,054 ns/op   2,435 B/op   66 allocs/op
+  V3 overhead:       +18.2%
 
-Rust (AM_BENCH_RUNS=3 AM_BENCH_ITERS=1000 cargo test --release):
-  V2 Postcard:       131,734 ns/op
-  V3 Postcard:       223,112 ns/op
-  V2 Msgpack:        210,293 ns/op
-  V3 Msgpack:        226,314 ns/op
+Rust (RUST_TEST_THREADS=1 TOKIO_WORKER_THREADS=1 AM_BENCH_RUNS=9 AM_BENCH_ITERS=8000 \
+      taskset -c 0 cargo test --release --lib -- --ignored --nocapture benchmark_protocol):
+  V2 Postcard:       30,836 ns/op
+  V3 Postcard:       35,224 ns/op
+  Postcard overhead: +14.2%
+  V2 Msgpack:        33,657 ns/op
+  V3 Msgpack:        36,931 ns/op
+  Msgpack overhead:  +9.7%
+
+Same-codec comparison (MsgpackCompact):
+  V2: Rust 1.16x faster   (38,969 -> 33,657 ns/op)
+  V3: Rust 1.25x faster   (46,054 -> 36,931 ns/op)
 ```
 
 **Notes on the validation run**:
-- Go numbers are consistent with the reference run (~6% variation, within normal
-  range for a shared CI environment).
-- Rust numbers are 2–3× higher than the reference run. Likely causes:
-  - **tokio runtime contention**: benchmark harness runs inside `#[tokio::test]`,
-    sharing the multi-thread runtime with the server. The reference run may have
-    used a dedicated runtime or different thread configuration.
-  - **Release profile differences**: LTO/codegen-units settings affect async
-    state machine optimization.
-  - **CPU frequency scaling**: Xeon E5-2680 v4 turbo boost behavior varies
-    across runs in shared environments.
-- The relative V3 overhead within each language is the most stable metric:
-  Go +9.7%, Rust +7.6% (Msgpack), consistent with architectural expectations.
-- **Recommendation**: re-run Rust benchmarks with a dedicated single-threaded
-  tokio runtime and pinned CPU frequency for stable absolute numbers.
+- These numbers are directly comparable: both languages were run on the same
+  host, pinned to the same CPU core, with one runtime worker (`GOMAXPROCS=1`
+  for Go, `TOKIO_WORKER_THREADS=1` for Rust), and 9 measured runs × 8000 ops.
+- Absolute latencies are much lower than the earlier shared-machine runs because
+  the single-core pinned setup reduces scheduler noise and improves cache
+  locality for **both** implementations, making the comparison fairer.
+- For cross-language claims, use the Msgpack pair above (`Go` vs `Rust Msgpack`)
+  rather than Rust's default Postcard codec.
+- Under the matched setup, Rust still leads, but the gap is modest:
+  about `1.16x` on V2 and `1.25x` on V3 when both use MsgpackCompact.
 
-Rust also benchmarks with its default codec (Postcard, faster than Msgpack):
+**Free run** (2026-04-01, same CPU, normal unconstrained setup):
+```
+Go (go test -run '^$' -bench='BenchmarkProtocol(V2SendRecv|V3RecoverySendRecv)$' \
+    -benchmem -count=9 -benchtime=8000x . ; median reported below):
+  V2 SendRecv:       106,525 ns/op   2,338 B/op   64 allocs/op
+  V3 Recovery:       118,782 ns/op   2,438 B/op   66 allocs/op
+  V3 overhead:       +11.5%
+
+Rust (AM_BENCH_RUNS=9 AM_BENCH_ITERS=8000 \
+      cargo test --release --lib -- --ignored --nocapture benchmark_protocol):
+  V2 Postcard:       64,124 ns/op
+  V3 Postcard:       66,642 ns/op
+  Postcard overhead: +3.9%
+  V2 Msgpack:        69,748 ns/op
+  V3 Msgpack:        75,006 ns/op
+  Msgpack overhead:  +7.5%
+
+Same-codec comparison (MsgpackCompact):
+  V2: Rust 1.53x faster   (106,525 -> 69,748 ns/op)
+  V3: Rust 1.58x faster   (118,782 -> 75,006 ns/op)
+```
+
+**Notes on the free run**:
+- This is the "normal machine" case: no pinned CPU, no forced single-worker
+  runtime, and Go uses its default `GOMAXPROCS` for the host.
+- These numbers are more representative of casual local runs, but they include
+  scheduler noise, CPU migration, and cache effects from the general-purpose
+  runtime configuration.
+- The free-run gap is larger than the matched single-core gap because Go's
+  default benchmark run here used `-24` worker scheduling on this 24-thread
+  host, while Rust's harness also ran with its default multi-thread runtime.
+
+Rust also benchmarks with its default codec (Postcard, faster than Msgpack).
+From the free run above:
 ```
                   Rust Postcard (ns/op)   Rust Msgpack (ns/op)   Postcard speedup
-V2 SendRecv        58,672                  75,142                 1.28x
-V3 Recovery        64,133                  79,209                 1.24x
+V2 SendRecv        64,124                  69,748                 1.09x
+V3 Recovery        66,642                  75,006                 1.13x
 ```
 
 **Optimizations applied to Go:**
@@ -244,9 +288,9 @@ V2 benefited more because the plain writer path fully leverages buffered I/O (he
 
 ## Root Cause Analysis
 
-The remaining gap after Go optimizations is **~1.3x** for V2 and **~1.4x** for
-V3. The absolute difference is ~24k ns/op (V2) and ~33k ns/op (V3). The
-following factors explain where those nanoseconds go.
+Under the free-run setup, the remaining gap is **~1.5x** for V2 and **~1.6x** for
+V3. Under the matched single-core setup, the gap narrows to **~1.2x** for V2 and
+**~1.3x** for V3. The following factors explain where the difference comes from.
 
 ### 1. Unbuffered I/O in Go — ✅ Fixed
 
@@ -328,9 +372,9 @@ optimization could apply to Rust, but the savings would be smaller (~200 ns).
 | Merge decoder into reader goroutine | ~7,000 ns | Medium | Not done |
 | Code-gen msgpack codec | ~4,000 ns | Hard | Not done |
 
-With optimizations 1-3 applied, the gap is **1.32x** (V2) and **1.41x** (V3).
-
-With all optimizations: Go V2 would be ~88k ns/op → gap narrows to ~1.17x.
+With optimizations 1-3 applied, the gap under matched single-core conditions is
+**1.16x** (V2) and **1.25x** (V3). Under free-run conditions the gap widens to
+**1.53x** (V2) and **1.58x** (V3) due to scheduler and cache effects.
 
 The remaining gap is fundamental:
 - Tokio's cooperative scheduling vs Go's preemptive goroutines
@@ -339,29 +383,35 @@ The remaining gap is fundamental:
 
 ## V3 Recovery Overhead
 
-Reference run:
+**Reference run** (from initial benchmarking session):
 ```
 Go  V3 overhead: +13.2%  (98,983 → 112,003 ns/op)
 Rust V3 overhead: +5.4%  (75,142 →  79,209 ns/op)
 ```
 
-Validation run (2026-04-01):
+**Matched single-core run** (2026-04-01):
 ```
-Go  V3 overhead: +9.7%   (105,070 → 115,246 ns/op)
-Rust V3 overhead: +7.6%  (210,293 → 226,314 ns/op, Msgpack)
+Go  V3 overhead: +18.2%  (38,969 → 46,054 ns/op)
+Rust V3 overhead: +9.7%  (33,657 → 36,931 ns/op, Msgpack)
 ```
 
-Go's V3 overhead (+13.2%) comes from:
+**Free run** (2026-04-01):
+```
+Go  V3 overhead: +11.5%  (106,525 → 118,782 ns/op)
+Rust V3 overhead: +7.5%  (69,748 → 75,006 ns/op, Msgpack)
+```
+
+Go's V3 overhead comes from:
 - Recovery state management (transport checks, channel synchronization)
 - Replay buffer bookkeeping
 - Additional allocations (66 vs 64 allocs/op, 2,439 vs 2,338 B/op)
 
-Rust's V3 overhead (+5.4%) is lower because:
+Rust's V3 overhead is lower because:
 - `ack_every=64` means ACK frames are batched (1 ACK per 64 messages)
 - Recovery state updates use atomic operations with no mutex in the fast path
 - The async writer loop handles recovery with minimal additional overhead
 
-Go's overhead is ~2.4x Rust's overhead in absolute terms (~13k vs ~4k ns/op),
-which aligns with the goroutine scheduling cost difference (each recovery
-check adds another goroutine yield in Go, but only a cheap state machine
-branch in Rust).
+Go's overhead is consistently higher than Rust's across all setups, which
+aligns with the goroutine scheduling cost difference: each recovery check
+adds another goroutine yield in Go, but only a cheap state machine branch
+in Rust.
