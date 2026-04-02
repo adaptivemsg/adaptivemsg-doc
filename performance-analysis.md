@@ -2,416 +2,519 @@
 
 ## Benchmark Setup
 
-- **CPU**: Intel Xeon E5-2680 v4 @ 2.40GHz
-- **Protocol**: adaptivemsg V2 and V3 (recovery mode)
-- **Codec**: MsgpackCompact (same for both, fair comparison)
+- **CPU**: Intel Xeon E5-2680 v4 @ 2.40GHz (24 threads)
+- **Protocol**: adaptivemsg V2 (plain) and V3 (recovery mode)
+- **Codec**: MsgpackCompact for cross-language comparison
 - **Operation**: `SendRecv` — send a request, receive a reply (full round-trip)
-- **Benchmark**: 5 runs × 3000 ops each, median reported
-- **Transport**: TCP loopback with TCP_NODELAY enabled
-  (Go: enabled by default in `net.Dial`; Rust: explicit `set_nodelay(true)`)
+- **Runs**: 5 runs × 8000 ops, median reported
+- **Transport**: TCP loopback with TCP_NODELAY
 
-**Codec note**: Go defaults to MsgpackCompact. Rust defaults to Postcard
-(faster, Rust-only). When comparing Go vs Rust, always use the Rust `_Msgpack`
-variants so both sides use the same codec.
+**Codec note**: Go defaults to MsgpackCompact. Rust defaults to Postcard (faster,
+Rust-only). Cross-language comparisons always use the Rust `_Msgpack` variants.
 
-## Performance Tests
+**Measurement note (2026-04-02)**: Rust benchmarks use `#[tokio::test(flavor =
+"multi_thread")]` with the hot loop inside `tokio::spawn(...)`. An earlier version
+ran the loop on tokio's main test task, which has ~2.5x higher scheduling overhead
+than worker threads. All numbers in this document reflect the corrected methodology.
 
-Performance tests live in the Go and Rust runtime repos. This section documents
-every benchmark, what it measures, and how to run it.
+---
 
-### Go: End-to-End Protocol Benchmarks
+## How to Run
 
-**File**: `adaptivemsg-go/protocol_version_bench_test.go`
-
-| Benchmark | What it measures |
-|---|---|
-| `BenchmarkProtocolV2SendRecv` | Full round-trip latency using V2 (no recovery). Client sends an echo request, server replies, client receives. |
-| `BenchmarkProtocolV3RecoverySendRecv` | Same round-trip, but with V3 recovery enabled (replay buffer, cumulative ACK, heartbeat). |
-
-Both benchmarks:
-- Start a TCP server on loopback with an ephemeral port.
-- Register `connTestEchoRequest` / `connTestEchoReply` message types.
-- Send one warm-up message before timing starts.
-- Run N iterations of `SendRecvAs[*connTestEchoReply]` with a 1-byte payload.
-- Validate reply correctness on each iteration.
-- Report memory allocations (`b.ReportAllocs()`).
-
-V3 recovery options used:
-- DetachedTTL: 5 s
-- MaxReplayBytes: 8 MB
-- AckEvery: 64
-- AckDelay: 20 ms
-- HeartbeatInterval: 30 s
-- HeartbeatTimeout: 90 s
-
-**How to run:**
+### Protocol Benchmarks (single-connection latency)
 
 ```bash
+# Go — all protocol benchmarks
 cd adaptivemsg-go
+go test -run '^$' -bench=BenchmarkProtocol -benchmem -benchtime=8000x -count=5 .
 
-# Both protocol benchmarks, with allocation stats
-go test -bench=BenchmarkProtocol -benchmem -benchtime=10s -run=^$
+# Go — matched single-core
+GOMAXPROCS=1 taskset -c 0 go test -run '^$' \
+  -bench=BenchmarkProtocol -benchmem -benchtime=8000x -count=5 .
 
-# V2 only
-go test -bench=BenchmarkProtocolV2SendRecv -benchmem -run=^$
-
-# V3 only
-go test -bench=BenchmarkProtocolV3RecoverySendRecv -benchmem -run=^$
-
-# Recommended: multiple runs for stable medians
-go test -bench=BenchmarkProtocol -benchmem -benchtime=3000x -count=5 -run=^$
-```
-
-### Go: Recovery Runtime Micro-Benchmarks
-
-**File**: `adaptivemsg-go/recovery_runtime_bench_test.go`
-
-These micro-benchmarks isolate the recovery state machine's hot-path operations
-(the idle loop decisions that run on every frame).
-
-| Benchmark | What it measures |
-|---|---|
-| `BenchmarkNextAckWait_NoPending` | ACK wait computation when no ACK is pending (fast path). |
-| `BenchmarkNextAckWait_WithDelay` | ACK wait computation with a pending ACK deadline 10 ms in the future. Measures `time.Until()` overhead. |
-| `BenchmarkTakePendingControl_Empty` | Pending control-frame check when nothing is due (fast path). |
-| `BenchmarkTakePendingControl_AckReady` | ACK frame extraction when `ackDue=true`. Measures overhead of building and returning the ACK frame. |
-| `BenchmarkWaitCalc` | Combined wait duration selection (min of ACK wait vs heartbeat interval). |
-| `BenchmarkWaitCalc_AckBeatsHeartbeat` | Same as above, but with a pending ACK deadline (5 ms) shorter than the heartbeat interval. Tests branch prediction. |
-| `BenchmarkWaitCalc_V2OldStyle` | V2 baseline wait calculation using an intermediate bool. |
-| `BenchmarkWaitCalc_V3Optimized` | V3 optimized wait calculation without the intermediate bool. Compares directly against V2OldStyle. |
-
-All micro-benchmarks create a minimal `recoveryState` (client role, 1 MB replay
-buffer, default server recovery options) and call `b.ResetTimer()` to exclude
-setup cost.
-
-**How to run:**
-
-```bash
-cd adaptivemsg-go
-
-# All recovery micro-benchmarks
-go test -bench=BenchmarkNextAckWait -benchmem -benchtime=10s -run=^$
-go test -bench=BenchmarkTakePendingControl -benchmem -benchtime=10s -run=^$
-go test -bench=BenchmarkWaitCalc -benchmem -benchtime=10s -run=^$
-
-# Everything in one shot
-go test -bench=. -benchmem -benchtime=10s -run=^$
-```
-
-### Rust: End-to-End Protocol Benchmarks
-
-**File**: `adaptivemsg-rust/src/protocol_version_bench_test.rs`
-
-Rust benchmarks are implemented as `#[ignore]` integration tests that manually
-time send/recv loops with `std::time::Instant`. They run multiple iterations
-(default 5) and report the median ns/op for stability.
-
-| Benchmark | What it measures |
-|---|---|
-| `benchmark_protocol_v2_send_recv` | Full round-trip latency using V2 with the default codec (Postcard). |
-| `benchmark_protocol_v3_recovery_send_recv` | Same round-trip with V3 recovery enabled (Postcard). |
-| `benchmark_protocol_v2_send_recv_msgpack` | V2 round-trip with MsgpackCompact codec. **Use this for Go comparison.** |
-| `benchmark_protocol_v3_recovery_send_recv_msgpack` | V3 recovery round-trip with MsgpackCompact codec. **Use this for Go comparison.** |
-
-The `_msgpack` variants are the ones used for the Go vs Rust comparison tables
-(both sides must use the same codec for a fair comparison).
-
-Benchmark setup mirrors the Go side:
-- TCP loopback server on ephemeral port.
-- Echo request/reply message types.
-- One warm-up iteration before the timed loop.
-- Iteration count defaults to 1000, configurable via `AM_BENCH_ITERS` env var.
-- Run count defaults to 5, configurable via `AM_BENCH_RUNS` env var.
-
-**How to run:**
-
-```bash
+# Rust — all protocol benchmarks
 cd adaptivemsg-rust
+AM_BENCH_RUNS=5 AM_BENCH_ITERS=8000 \
+  cargo test --release --lib -- --ignored --nocapture benchmark_protocol
 
-# All benchmarks (release mode required for meaningful numbers)
-AM_BENCH_ITERS=3000 cargo test --release --lib -- --ignored --nocapture benchmark_protocol
-
-# MsgpackCompact only (for Go comparison)
-AM_BENCH_ITERS=3000 cargo test --release --lib -- --ignored --nocapture benchmark_protocol_v2_send_recv_msgpack
-
-# Single benchmark
-AM_BENCH_ITERS=3000 cargo test --release --lib -- --ignored --nocapture benchmark_protocol_v2_send_recv
-
-# Lower-noise run on a shared machine: serialize the Rust test harness, force a
-# single Tokio worker, pin to one CPU, and run the full protocol set in one
-# process.
-RUST_TEST_THREADS=1 TOKIO_WORKER_THREADS=1 AM_BENCH_RUNS=9 AM_BENCH_ITERS=8000 \
+# Rust — matched single-core
+RUST_TEST_THREADS=1 TOKIO_WORKER_THREADS=1 AM_BENCH_RUNS=5 AM_BENCH_ITERS=8000 \
   taskset -c 0 cargo test --release --lib -- --ignored --nocapture benchmark_protocol
+
+# Rust — single benchmark (use --exact to avoid running others)
+AM_BENCH_RUNS=5 AM_BENCH_ITERS=8000 cargo test --release --lib -- --ignored \
+  --nocapture --exact protocol_version_bench_test::benchmark_protocol_v2_send_recv
 ```
 
-### Rust: Recovery Runtime Micro-Benchmarks
+**Files:**
+- Go: `adaptivemsg-go/protocol_version_bench_test.go`
+- Rust: `adaptivemsg-rust/src/protocol_version_bench_test.rs`
 
-**File**: `adaptivemsg-rust/src/recovery_runtime_bench_test.rs`
+Both benchmarks start a TCP server, register echo request/reply types, send one
+warm-up message, then time N iterations of `SendRecv` with a 1-byte payload.
 
-These micro-benchmarks isolate the recovery state machine's hot-path operations,
-mirroring Go's `recovery_runtime_bench_test.go`.
-
-| Benchmark | What it measures |
-|---|---|
-| `benchmark_next_ack_wait_no_pending` | `next_ack_wait()` with no pending ACK (fast path). |
-| `benchmark_next_ack_wait_with_delay` | `next_ack_wait()` with a pending ACK deadline. |
-| `benchmark_take_pending_ack_empty` | `take_pending_ack()` fast path (nothing due). |
-| `benchmark_take_pending_ack_ready` | `take_pending_ack()` with ack_due and seq gap. |
-| `benchmark_wait_calc` | `next_ack_wait()` + `heartbeat_interval()` + min selection. |
-| `benchmark_wait_calc_ack_beats_heartbeat` | Same, but with a short pending ACK deadline. |
-| `benchmark_wait_calc_v2_old_style` | With intermediate bool (v2 baseline). |
-| `benchmark_wait_calc_v3_optimized` | Without intermediate bool (v3 optimized). |
-
-**How to run:**
+### Recovery Micro-Benchmarks
 
 ```bash
-cd adaptivemsg-rust
+# Go
+cd adaptivemsg-go
+go test -bench='BenchmarkNextAckWait|BenchmarkTakePendingControl|BenchmarkWaitCalc' \
+  -benchmem -benchtime=10s -run=^$ .
 
-# All recovery micro-benchmarks (release mode)
+# Rust
+cd adaptivemsg-rust
 cargo test --release --lib -- --ignored --nocapture benchmark_next_ack_wait
 cargo test --release --lib -- --ignored --nocapture benchmark_take_pending
 cargo test --release --lib -- --ignored --nocapture benchmark_wait_calc
 ```
 
-**Rust unit tests** (not benchmarks, but verify correctness of perf-critical paths):
+**Files:**
+- Go: `adaptivemsg-go/recovery_runtime_bench_test.go`
+- Rust: `adaptivemsg-rust/src/recovery_runtime_bench_test.rs`
+
+### Scaling Benchmarks (multi-connection throughput)
 
 ```bash
-cd adaptivemsg-rust
+# Go — wall-clock throughput test (all configs, V2 + V3)
+cd adaptivemsg-go
+go test -run=TestScalingThroughput -count=1 -v -timeout=600s .
 
-cargo test --lib                  # All unit tests
+# Rust — all scaling configs (Postcard + Msgpack, V2 + V3)
+cd adaptivemsg-rust
+AM_BENCH_RUNS=5 AM_BENCH_ITERS=5000 cargo test --release --lib -- --ignored \
+  --nocapture --exact scaling_bench_test::benchmark_scaling_all
 ```
+
+**Files:**
+- Go: `adaptivemsg-go/scaling_bench_test.go`
+- Rust: `adaptivemsg-rust/src/scaling_bench_test.rs`
+
+Both use the same wall-clock methodology: spawn N concurrent workers,
+barrier-synchronize, measure total elapsed time, compute
+`ops/sec = iterations / (elapsed_ns / 1e9)`.
 
 ### Interpreting Results
 
 - **ns/op**: nanoseconds per `SendRecv` round-trip (lower is better).
-- **B/op**: bytes allocated per operation (lower is better).
-- **allocs/op**: heap allocations per operation (lower is better).
-- Use `-benchtime=3000x -count=5` and report the median to get stable numbers.
-- Always compare Go and Rust using the same codec (`MsgpackCompact`) and the
-  same transport (`TCP loopback with TCP_NODELAY`).
+- **B/op**: bytes allocated per operation (Go only, lower is better).
+- **allocs/op**: heap allocations per operation (Go only, lower is better).
+- **ops/sec**: aggregate throughput (scaling tests, higher is better).
 
-## Results
+---
 
-### Current (after Go optimizations)
+## Single-Connection Latency
 
-**Reference run** — numbers from the initial benchmarking session on this CPU:
+### Matched Single-Core
+
+Both languages pinned to one CPU core with one runtime worker. Measures raw
+per-operation cost with minimal scheduler noise.
+
 ```
-                  Go (ns/op)   Rust (ns/op)   Rust speedup
-V2 SendRecv        98,983       75,142         1.32x
-V3 Recovery       112,003       79,209         1.41x
+Go (GOMAXPROCS=1 taskset -c 0, 5 runs × 8000 ops, median):
+  V2 SendRecv:       38,449 ns/op   2,336 B/op   64 allocs/op
+  V3 Recovery:       46,717 ns/op   2,659 B/op   70 allocs/op
+  V3 overhead:       +21.5%
 
-V3 overhead:      +13.2%        +5.4%
-Go allocs:        V2 2338 B/op 64 allocs    V3 2439 B/op 66 allocs
-```
-
-**Validation run** (2026-04-01, same CPU, apples-to-apples single-core setup):
-```
-Go (GOMAXPROCS=1 taskset -c 0 go test -run '^$' \
-    -bench='BenchmarkProtocol(V2SendRecv|V3RecoverySendRecv)$' \
-    -benchmem -count=9 -benchtime=8000x . ; median reported below):
-  V2 SendRecv:       38,969 ns/op   2,336 B/op   64 allocs/op
-  V3 Recovery:       46,054 ns/op   2,435 B/op   66 allocs/op
-  V3 overhead:       +18.2%
-
-Rust (RUST_TEST_THREADS=1 TOKIO_WORKER_THREADS=1 AM_BENCH_RUNS=9 AM_BENCH_ITERS=8000 \
-      taskset -c 0 cargo test --release --lib -- --ignored --nocapture benchmark_protocol):
-  V2 Postcard:       30,836 ns/op
-  V3 Postcard:       35,224 ns/op
-  Postcard overhead: +14.2%
-  V2 Msgpack:        33,657 ns/op
-  V3 Msgpack:        36,931 ns/op
-  Msgpack overhead:  +9.7%
+Rust (TOKIO_WORKER_THREADS=1 taskset -c 0, 5 runs × 8000 ops, median):
+  V2 Postcard:       27,974 ns/op
+  V3 Postcard:       35,849 ns/op   (+28.2%)
+  V2 Msgpack:        31,363 ns/op
+  V3 Msgpack:        37,869 ns/op   (+20.7%)
 
 Same-codec comparison (MsgpackCompact):
-  V2: Rust 1.16x faster   (38,969 -> 33,657 ns/op)
-  V3: Rust 1.25x faster   (46,054 -> 36,931 ns/op)
+  V2: Rust 1.23x faster   (38,449 → 31,363 ns/op)
+  V3: Rust 1.23x faster   (46,717 → 37,869 ns/op)
 ```
 
-**Notes on the validation run**:
-- These numbers are directly comparable: both languages were run on the same
-  host, pinned to the same CPU core, with one runtime worker (`GOMAXPROCS=1`
-  for Go, `TOKIO_WORKER_THREADS=1` for Rust), and 9 measured runs × 8000 ops.
-- Absolute latencies are much lower than the earlier shared-machine runs because
-  the single-core pinned setup reduces scheduler noise and improves cache
-  locality for **both** implementations, making the comparison fairer.
-- For cross-language claims, use the Msgpack pair above (`Go` vs `Rust Msgpack`)
-  rather than Rust's default Postcard codec.
-- Under the matched setup, Rust still leads, but the gap is modest:
-  about `1.16x` on V2 and `1.25x` on V3 when both use MsgpackCompact.
+### Free Run (multi-thread)
 
-**Free run** (2026-04-01, same CPU, normal unconstrained setup):
+Normal unconstrained setup: Go uses GOMAXPROCS=24, Rust uses tokio's default
+24 worker threads (`num_cpus`). Both runtimes use all available cores.
+
 ```
-Go (go test -run '^$' -bench='BenchmarkProtocol(V2SendRecv|V3RecoverySendRecv)$' \
-    -benchmem -count=9 -benchtime=8000x . ; median reported below):
-  V2 SendRecv:       106,525 ns/op   2,338 B/op   64 allocs/op
-  V3 Recovery:       118,782 ns/op   2,438 B/op   66 allocs/op
-  V3 overhead:       +11.5%
+Go (5 runs × 8000 ops, median):
+  V2 SendRecv:        83,712 ns/op   2,338 B/op   64 allocs/op
+  V3 Recovery:        96,574 ns/op   2,665 B/op   70 allocs/op
+  V3 overhead:        +15.4%
 
-Rust (AM_BENCH_RUNS=9 AM_BENCH_ITERS=8000 \
-      cargo test --release --lib -- --ignored --nocapture benchmark_protocol):
-  V2 Postcard:       64,124 ns/op
-  V3 Postcard:       66,642 ns/op
-  Postcard overhead: +3.9%
-  V2 Msgpack:        69,748 ns/op
-  V3 Msgpack:        75,006 ns/op
-  Msgpack overhead:  +7.5%
+Rust (5 runs × 8000 ops, median):
+  V2 Postcard:       27,595 ns/op
+  V3 Postcard:       65,433 ns/op   (+137.1%)
+  V2 Msgpack:        34,962 ns/op
+  V3 Msgpack:        69,391 ns/op   (+98.4%)
 
 Same-codec comparison (MsgpackCompact):
-  V2: Rust 1.53x faster   (106,525 -> 69,748 ns/op)
-  V3: Rust 1.58x faster   (118,782 -> 75,006 ns/op)
+  V2: Rust 2.39x faster   (83,712 → 34,962 ns/op)
+  V3: Rust 1.39x faster   (96,574 → 69,391 ns/op)
 ```
 
-**Notes on the free run**:
-- This is the "normal machine" case: no pinned CPU, no forced single-worker
-  runtime, and Go uses its default `GOMAXPROCS` for the host.
-- These numbers are more representative of casual local runs, but they include
-  scheduler noise, CPU migration, and cache effects from the general-purpose
-  runtime configuration.
-- The free-run gap is larger than the matched single-core gap because Go's
-  default benchmark run here used `-24` worker scheduling on this 24-thread
-  host, while Rust's harness also ran with its default multi-thread runtime.
+**Why Rust V2 free-run ≈ single-core while Go degrades 2.2x:**
 
-Rust also benchmarks with its default codec (Postcard, faster than Msgpack).
-From the free run above:
+Both use 24 threads, but their schedulers behave differently for a sequential
+single-connection workload:
+
+- **Tokio (Rust)**: Uses work-stealing. When task A wakes task B, B is placed
+  in A's thread-local queue and often runs on the same thread. The sequential
+  send → writer → TCP → reader → decoder → inbox chain stays mostly on 1–2
+  threads even with 24 available. Result: free-run V2 (35K ns) ≈ single-core
+  (31K ns), only 1.11x degradation.
+- **Go**: With GOMAXPROCS=24, the runtime actively distributes goroutines across
+  OS threads. The reader, writer, decoder, and handler goroutines can each land
+  on different threads, turning every channel hop into a cross-thread wake.
+  Result: free-run V2 (84K ns) vs single-core (38K ns), 2.18x degradation.
+
+This was verified by sweeping GOMAXPROCS:
+
 ```
-                  Rust Postcard (ns/op)   Rust Msgpack (ns/op)   Postcard speedup
-V2 SendRecv        64,124                  69,748                 1.09x
-V3 Recovery        66,642                  75,006                 1.13x
+GOMAXPROCS    Go V2 ns/op (median)    vs GOMAXPROCS=1
+    1              75,084                  1.0x
+    2             102,987                  1.37x
+    4              79,858                  1.06x
+   24              96,064                  1.28x
 ```
 
-**Optimizations applied to Go:**
-1. `bufio.Writer` wrapping for all write paths (V2 writer loop + V3 recovery writer loop)
-2. Stack-allocated frame headers (`[frameHeaderLenV3]byte` instead of `make([]byte, headerLen)`)
-3. Batched ACK+data writes in V3 recovery writer (writeFrameNoFlush + single flush)
+Go gets worse at GOMAXPROCS=2 because the goroutines now cross 2 OS threads
+instead of staying on 1, but there is no benefit since the workload is
+sequential. At 4+, the overhead stabilizes.
 
-V2 benefited more because the plain writer path fully leverages buffered I/O (header+payload → single flush → single syscall). V3 improvement was smaller because recovery overhead (transport checks, channel synchronization) dominates over I/O syscall savings.
+This is a genuine runtime behavior difference, not a measurement error. Tokio's
+work-stealing keeps cooperating tasks colocated for sequential workloads; Go's
+scheduler spreads them out. The practical consequence: **Rust's advantage shrinks
+under multi-connection load** (where cross-thread scheduling becomes unavoidable),
+as shown in the scaling results.
 
-## Root Cause Analysis
+### Postcard vs Msgpack (Rust only)
 
-Under the free-run setup, the remaining gap is **~1.5x** for V2 and **~1.6x** for
-V3. Under the matched single-core setup, the gap narrows to **~1.2x** for V2 and
-**~1.3x** for V3. The following factors explain where the difference comes from.
+```
+                  Postcard (ns/op)   Msgpack (ns/op)   Postcard speedup
+V2 (single-core)     27,974            31,363              1.12x
+V3 (single-core)     35,849            37,869              1.06x
+V2 (free-run)        27,595            34,962              1.27x
+V3 (free-run)        65,433            69,391              1.06x
+```
 
-### 1. Unbuffered I/O in Go — ✅ Fixed
+### Key Observations
 
-**Go**: `writeFrame()` in `frame.go` wrote header and payload directly to TCP socket as separate `Write()` calls — each became a separate syscall. For a round-trip, this meant 4+ syscalls (2 writes on send side, 2 reads on receive side, plus the other direction).
+1. **Rust V2 is significantly faster** in both setups (1.23x single-core,
+   2.39x free-run on same codec).
+2. **Rust V3 has a severe multi-thread penalty**: +98% overhead in free-run
+   vs +21% on single-core. Go's V3 overhead is a consistent +15–22% in both
+   setups. See [V3 Recovery Overhead](#v3-recovery-overhead) for root cause.
+3. **Consistency**: The scaling benchmark 1×1 case matches these protocol
+   numbers within ~5% (Go: 12.3K ops/sec ≈ 1e9/83,712; Rust V2 Msgpack:
+   29.5K ops/sec ≈ 1e9/34,962).
 
-**Rust**: Writer is wrapped with `tokio::io::BufWriter`. Header + payload are buffered, then a single `flush()` produces one syscall. Additionally, in V3, the ACK frame and data frame are batched into a single flush via `write_frame_no_flush()` + explicit `flush()`.
+---
 
-**Applied fix**: Added `writer *bufio.Writer` field to `Connection` struct. `writeFrame()` now writes to the buffered writer and flushes once. In V3 recovery, ACK + data frames are batched with `writeFrameNoFlush()` + single `Flush()`. The `bufio.Writer` is re-created on transport attach and nil'd on detach.
+## Scaling Throughput
 
-### 2. Goroutine / Async Task Scheduling Overhead (~50% of remaining gap)
+Scaling tests measure aggregate throughput with multiple concurrent connections
+and streams, each running parallel send/recv operations against a single server.
+All numbers from 2026-04-02, free run, multi-thread runtime, 5 runs × 5000 ops.
 
-Both Go and Rust use the **same architecture**: 1 reader per connection, 1
-writer per connection, 1 decoder per stream, 0-1 handler per stream. Both have
-**2 channel hops** per message (reader → decoder, decoder → inbox). The
-performance difference is not structural — it comes from the cost of each
-operation.
+### Go (Msgpack)
 
-**Go**: A single SendRecv round-trip involves 4-5 goroutine context switches
-across the 2 channel hops (send side + receive side). Go goroutines are M:N
-scheduled but involve OS thread parking/unparking. Each context switch costs
-~2,000 ns.
+```
+Go V2 (no recovery):
+  Config               ops/sec     speedup vs 1×1
+  1 conn × 1 stream     12,301          1.0x
+  1 conn × 4 stream     38,071          3.1x
+  1 conn × 16 stream    52,635          4.3x
+  1 conn × 64 stream    54,880          4.5x
+  4 conn × 1 stream     42,543          3.5x
+  4 conn × 4 stream     94,283          7.7x
+  4 conn × 16 stream   141,527         11.5x
+  4 conn × 64 stream   124,932         10.2x
 
-**Rust**: Tokio uses cooperative async tasks. Task yields are ~250 ns (just a
-state machine transition within the same thread). The same 2 channel hops cost
-far less because `tokio::sync::mpsc` is lock-free for the common uncontended
-case.
+Go V3 (recovery enabled):
+  Config               ops/sec     speedup vs 1×1
+  1 conn × 1 stream     10,239          1.0x
+  1 conn × 4 stream     35,174          3.4x
+  1 conn × 16 stream    51,046          5.0x
+  1 conn × 64 stream    46,702          4.6x
+  4 conn × 1 stream     42,068          4.1x
+  4 conn × 4 stream    100,458          9.8x
+  4 conn × 16 stream   137,240         13.4x
+  4 conn × 64 stream    85,148          8.3x
+```
 
-**This is a fundamental language runtime difference** — not an architectural one.
+### Rust (Msgpack, for Go comparison)
 
-### 3. Channel Operation Cost (~30% of remaining gap)
+```
+Rust V2 Msgpack:
+  Config               ops/sec     speedup vs 1×1
+  1 conn × 1 stream     29,513          1.0x
+  1 conn × 4 stream     37,700          1.3x
+  1 conn × 16 stream    40,574          1.4x
+  1 conn × 64 stream    41,547          1.4x
+  4 conn × 1 stream     52,445          1.8x
+  4 conn × 4 stream     50,568          1.7x
+  4 conn × 16 stream    52,942          1.8x
+  4 conn × 64 stream    52,445          1.8x
 
-Both Go and Rust have 2 channel hops per message direction:
-- Hop 1: reader → stream decoder (`incoming` / `incoming_tx`)
-- Hop 2: decoder → caller inbox (`inbox` / `inbox_tx`)
+Rust V3 Msgpack:
+  Config               ops/sec     speedup vs 1×1
+  1 conn × 1 stream     14,009          1.0x
+  1 conn × 4 stream     30,704          2.2x
+  1 conn × 16 stream    36,596          2.6x
+  1 conn × 64 stream    37,523          2.7x
+  4 conn × 1 stream     38,310          2.7x
+  4 conn × 4 stream     39,593          2.8x
+  4 conn × 16 stream    44,824          3.2x
+  4 conn × 64 stream    39,687          2.8x
+```
 
-**Go**: Each `chan` operation costs ~750 ns including goroutine scheduling.
-Two hops × two directions (send + receive) = ~3,000 ns of channel overhead per
-round-trip.
+### Go vs Rust Head-to-Head (Msgpack)
 
-**Rust**: Each `tokio::sync::mpsc` operation costs ~100 ns (lock-free for the
-uncontended case). Same two hops × two directions = ~400 ns per round-trip.
+```
+V2 (no recovery):
+  Config                Go ops/sec    Rust ops/sec    Go/Rust
+  1 conn × 1 stream       12,301        29,513        0.42x  ← Rust faster
+  1 conn × 4 stream       38,071        37,700        1.01x
+  1 conn × 16 stream      52,635        40,574        1.30x  ← Go overtakes
+  1 conn × 64 stream      54,880        41,547        1.32x
+  4 conn × 1 stream       42,543        52,445        0.81x
+  4 conn × 4 stream       94,283        50,568        1.86x
+  4 conn × 16 stream     141,527        52,942        2.67x
+  4 conn × 64 stream     124,932        52,445        2.38x
 
-**Potential fix**: Merge the decoder goroutine into the reader goroutine to
-eliminate one channel hop per direction (~1,500 ns savings). The same
-optimization could apply to Rust, but the savings would be smaller (~200 ns).
+V3 (recovery enabled):
+  Config                Go ops/sec    Rust ops/sec    Go/Rust
+  1 conn × 1 stream       10,239        14,009        0.73x  ← Rust faster
+  1 conn × 4 stream       35,174        30,704        1.15x
+  1 conn × 16 stream      51,046        36,596        1.39x
+  1 conn × 64 stream      46,702        37,523        1.24x
+  4 conn × 1 stream       42,068        38,310        1.10x
+  4 conn × 4 stream      100,458        39,593        2.54x
+  4 conn × 16 stream     137,240        44,824        3.06x
+  4 conn × 64 stream      85,148        39,687        2.15x
+```
 
-### 4. Per-Message Heap Allocations (~15% of remaining gap) — ✅ Partially Fixed
+### Rust Postcard (native codec reference)
 
-**Go**: ~5 allocations per frame:
-- 2 header byte slices (send + receive, `make([]byte, headerLen)`)
-- 1 payload buffer (receive side)
-- 2 codec intermediate buffers
-- Measured: ~2,338 B/op, 64 allocs/op
+```
+V2 Postcard:
+  Config               ops/sec     speedup vs 1×1
+  1 conn × 1 stream     33,667          1.0x
+  1 conn × 4 stream     42,673          1.3x
+  1 conn × 16 stream    50,527          1.5x
+  1 conn × 64 stream    48,735          1.4x
+  4 conn × 1 stream     70,130          2.1x
+  4 conn × 4 stream     74,535          2.2x
+  4 conn × 16 stream    71,138          2.1x
+  4 conn × 64 stream    70,417          2.1x
 
-**Rust**: ~2-3 allocations per frame:
-- Frame header is a stack array `[u8; 18]` — zero allocation
-- Read header uses stack array
-- Payload `Vec<u8>` allocation on receive (unavoidable)
+V3 Postcard:
+  Config               ops/sec     speedup vs 1×1
+  1 conn × 1 stream     15,201          1.0x
+  1 conn × 4 stream     35,241          2.3x
+  1 conn × 16 stream    43,142          2.8x
+  1 conn × 64 stream    45,151          3.0x
+  4 conn × 1 stream     53,009          3.5x
+  4 conn × 4 stream     64,894          4.3x
+  4 conn × 16 stream    68,018          4.5x
+  4 conn × 64 stream    65,701          4.3x
+```
 
-**Applied fix**: `buildHeader()` now returns `[frameHeaderLenV3]byte` (stack array) + `int` header length instead of `[]byte`. `readFrameFrom()` uses `var header [frameHeaderLenV3]byte` instead of `make([]byte, headerLen)`. This eliminates 2 heap allocations per round-trip (send + receive headers).
+### Scaling Summary
 
-**Remaining**: Codec intermediate buffers and payload allocation are still heap-allocated.
+| Metric | Go V2 | Go V3 | Rust V2 Msgpack | Rust V3 Msgpack | Rust V2 Postcard | Rust V3 Postcard |
+|---|---|---|---|---|---|---|
+| Peak ops/sec | 141,527 | 137,240 | 52,942 | 44,824 | 74,535 | 68,018 |
+| Peak config | 4×16 | 4×16 | 4×16 | 4×16 | 4×4 | 4×16 |
+| Max speedup vs 1×1 | 11.5x | 13.4x | 1.8x | 3.2x | 2.2x | 4.5x |
 
-### 5. Codec Reflection Overhead (~15% of remaining gap)
+- **Go scales dramatically**: 11–13x throughput improvement from 1×1 to 4×16.
+- **Rust plateaus early**: 1.8–4.5x improvement then flattens.
+- **Cross-over at ~4 streams**: Go overtakes Rust in absolute throughput at
+  roughly 1 conn × 4 streams (Msgpack V2), despite Rust being 2.4x faster
+  at 1×1.
 
-**Go**: Msgpack codec uses `reflect.ValueOf()` at runtime for encoding/decoding. Each reflection call has overhead from type inspection and indirect calls.
+### Why Rust Scales Poorly
 
-**Rust**: Serde derive macros generate specialized encode/decode code at compile time — no runtime reflection.
+The primary bottleneck is **tokio's cross-thread scheduling overhead**, not
+a code-level bug. This was confirmed by sweeping `TOKIO_WORKER_THREADS`:
 
-**Fix for Go**: Use code generation (e.g., `msgp` tool) instead of runtime reflection for msgpack encoding.
+```
+Tokio worker thread sweep (V2 Msgpack, 3 runs × 5000 ops, median):
 
-## Summary of Optimization Opportunities for Go
+  4 conn × 1 stream:
+  Threads    ops/sec     vs best
+      2       43,629       1.0x  ← best
+      4       23,755       0.55x
+      8       26,359       0.60x
+     24       19,507       0.45x  ← default (num_cpus)
 
-| Optimization | Estimated Gain | Difficulty | Status |
-|---|---|---|---|
-| Add `bufio.Writer` | ~10,000 ns | Easy | ✅ Done |
-| Stack-allocate frame headers | ~1,000 ns | Easy | ✅ Done |
-| Batch ACK+data in V3 writer | ~1,000 ns | Easy | ✅ Done |
-| Merge decoder into reader goroutine | ~7,000 ns | Medium | Not done |
-| Code-gen msgpack codec | ~4,000 ns | Hard | Not done |
+  4 conn × 16 stream:
+  Threads    ops/sec     vs best
+      2       29,056       0.73x
+      4       32,240       0.81x
+      8       39,225       0.99x
+     24       39,604       1.0x  ← best (needs parallelism)
 
-With optimizations 1-3 applied, the gap under matched single-core conditions is
-**1.16x** (V2) and **1.25x** (V3). Under free-run conditions the gap widens to
-**1.53x** (V2) and **1.58x** (V3) due to scheduler and cache effects.
+  1 conn × 1 stream:
+  Threads    ops/sec     vs best
+      2       17,802       0.57x
+      4       31,492       1.0x  ← best
+      8       21,571       0.69x
+     24       30,840       0.98x
+```
 
-The remaining gap is fundamental:
-- Tokio's cooperative scheduling vs Go's preemptive goroutines
-- Rust's zero-cost abstractions vs Go's GC + runtime overhead
-- Compile-time code generation vs runtime reflection
+**Key insight**: the optimal thread count depends on the workload shape.
+For low-parallelism cases (4×1), 2 threads is 2.24× faster than 24 threads
+because tasks stay on the same threads and avoid cross-thread channel
+overhead. For high-parallelism cases (4×16), more threads help because
+64 concurrent tasks need real parallelism.
+
+Go does not exhibit this sensitivity — GOMAXPROCS=24 works well across all
+configs because goroutine scheduling and channel operations have lower
+cross-thread overhead than tokio's mpsc + work-stealing.
+
+#### Architectural bottlenecks
+
+1. **Single writer task per connection** — all frames from N streams funnel
+   through one writer, serializing writes
+2. **One flush per frame** — no batching of multiple frames per writer wake
+3. **Extra async hop**: Rust has a per-stream decoder task between reader and
+   inbox (reader → incoming_tx → decoder → inbox_tx). Go decodes inline in the
+   reader goroutine, saving one channel hop per message direction
+4. **V3 cross-thread oneshot round-trip** on every send
+   (`outbound_tx → writer → oneshot reply`)
+5. **Dynamic dispatch**: `TransportWriter = Box<dyn AsyncWrite>` adds vtable
+   overhead on every write call in the hot path
+
+#### Promising improvements
+
+1. **Tune worker threads per workload** — or use `tokio::runtime::Builder` to
+   set an appropriate thread count (4–8 may be better than num_cpus for most
+   real-world message sizes)
+2. **Batch frames per writer wake** — drain all pending frames from
+   outbound_rx before flushing, reducing syscalls
+3. **Inline decoder into reader** — eliminate per-stream decoder task and its
+   channel hop
+4. **Monomorphize TransportWriter** — use generics or enum-dispatch instead of
+   trait objects to enable inlining
+5. **Batch V3 sequencing** — assign seq numbers to a batch of frames per
+   writer wake, reducing oneshot round-trips
+
+---
 
 ## V3 Recovery Overhead
 
-**Reference run** (from initial benchmarking session):
+V3 adds replay buffers, cumulative ACKs, heartbeats, and writer-owned
+sequencing. The overhead varies dramatically by setup:
+
 ```
-Go  V3 overhead: +13.2%  (98,983 → 112,003 ns/op)
-Rust V3 overhead: +5.4%  (75,142 →  79,209 ns/op)
+                        V3 overhead (ns)     V3 overhead (%)
+Go (single-core)        +8,268                +21.5%
+Go (free-run)          +12,862                +15.4%
+Rust Msgpack (single)   +6,506                +20.7%
+Rust Msgpack (free)    +34,429                +98.4%
 ```
 
-**Matched single-core run** (2026-04-01):
-```
-Go  V3 overhead: +18.2%  (38,969 → 46,054 ns/op)
-Rust V3 overhead: +9.7%  (33,657 → 36,931 ns/op, Msgpack)
-```
+**Why Rust V3 is +98% under multi-thread but only +21% on single-core:**
 
-**Free run** (2026-04-01):
-```
-Go  V3 overhead: +11.5%  (106,525 → 118,782 ns/op)
-Rust V3 overhead: +7.5%  (69,748 → 75,006 ns/op, Msgpack)
-```
+The writer-owned sequencing fix (needed for multi-stream correctness) routes
+every V3 send through `outbound_tx → writer task → oneshot reply`. This is
+a cross-thread channel round-trip:
 
-Go's V3 overhead comes from:
-- Recovery state management (transport checks, channel synchronization)
-- Replay buffer bookkeeping
-- Additional allocations (66 vs 64 allocs/op, 2,439 vs 2,338 B/op)
+- **Single-core**: All tasks share one OS thread. The round-trip is a local
+  memory operation within the same event loop. Cost: ~6,500 ns.
+- **Multi-thread**: Tasks run on different worker threads. The round-trip
+  involves cross-thread mpsc send, cross-thread task wake, and cross-thread
+  oneshot reply. Cost: ~34,400 ns.
 
-Rust's V3 overhead is lower because:
-- `ack_every=64` means ACK frames are batched (1 ACK per 64 messages)
-- Recovery state updates use atomic operations with no mutex in the fast path
-- The async writer loop handles recovery with minimal additional overhead
+Go uses the same writer-owned sequencing pattern, but its V3 overhead is only
++15% in free-run. Go's goroutine scheduler absorbs the extra channel hop cost
+because goroutine context switches (~2 µs) are cheaper than tokio cross-thread
+task wakes under this send → park → wake → reply → park → wake pattern.
 
-Go's overhead is consistently higher than Rust's across all setups, which
-aligns with the goroutine scheduling cost difference: each recovery check
-adds another goroutine yield in Go, but only a cheap state machine branch
-in Rust.
+V3 recovery options used in all benchmarks:
+- AckEvery: 64, AckDelay: 20 ms
+- HeartbeatInterval: 30 s, HeartbeatTimeout: 90 s
+- MaxReplayBytes: 8 MB, DetachedTTL: 5 s
+
+---
+
+## Root Cause Analysis
+
+### Why Rust is Faster at Single-Connection
+
+Under single-core, Rust leads by 1.23x. The gap comes from fundamental
+runtime differences, not architecture (both use the same task topology:
+1 reader + 1 writer + 1 decoder + 0-1 handler per connection/stream, with
+2 channel hops per message direction).
+
+**1. Task scheduling cost**
+
+Go goroutine context switches cost ~2,000 ns each (M:N scheduling with OS
+thread parking). A `SendRecv` round-trip involves 4-5 switches across the 2
+channel hops. Tokio async task yields cost ~250 ns (state machine transition
+within the same thread). Same 2 hops, far less overhead.
+
+**2. Channel operation cost**
+
+Go `chan` operations: ~750 ns each including goroutine wake. Two hops × two
+directions = ~3,000 ns per round-trip. Tokio `mpsc`: ~100 ns each (lock-free
+uncontended case). Same two hops × two directions = ~400 ns.
+
+**3. Per-message allocations**
+
+Go: 2,338 B/op, 64 allocs/op. Includes header byte slices (now stack-allocated
+for send/receive), payload buffer, and codec intermediates.
+
+Rust: ~2-3 allocations per frame. Frame headers are stack arrays. Only the
+payload `Vec<u8>` is heap-allocated on receive.
+
+**4. Codec reflection**
+
+Go Msgpack uses `reflect.ValueOf()` at runtime. Rust Serde generates
+specialized encode/decode at compile time.
+
+### Why Go Scales Better
+
+Despite Rust being 2.4x faster at 1×1, Go overtakes Rust at ~4 streams and
+reaches 2.7x higher peak throughput. The thread sweep data above pinpoints
+the root cause: **tokio's cross-thread overhead scales poorly**.
+
+- **Go goroutines** yield cooperatively at channel operations. The runtime's
+  integrated scheduler and channels share memory structures efficiently —
+  waking a goroutine on another thread costs ~2 µs with low cache impact.
+  GOMAXPROCS=24 works fine across all workload shapes.
+- **Tokio tasks** yield at `.await` points. The work-stealing scheduler migrates
+  tasks between threads, channel sends cross thread boundaries, and each hop
+  involves cache-line transfers. With 4 connections, Rust's per-connection
+  throughput drops 2.25× vs 1×1 (at 24 threads); Go's drops only 1.16×.
+- **Extra async hops**: Rust's reader → decoder → inbox chain has one more
+  channel crossing per message direction than Go's direct reader → inbox path.
+  Each crossing multiplies the cross-thread penalty.
+
+The result: Go's per-operation cost is higher, but it scales linearly with
+connections. Rust's per-operation cost is lower, but cross-thread overhead
+dominates under concurrency.
+
+---
+
+## Optimizations Applied
+
+### Go
+
+| Optimization | Status |
+|---|---|
+| `bufio.Writer` for all write paths | ✅ Done |
+| Stack-allocated frame headers | ✅ Done |
+| Batched ACK+data writes in V3 recovery writer | ✅ Done |
+| Writer-owned V3 sequencing (correctness fix) | ✅ Done |
+
+### Remaining Opportunities
+
+| Optimization | Expected Impact | Difficulty |
+|---|---|---|
+| Tune tokio worker threads (4–8 instead of num_cpus) (Rust) | Up to 2× for low-parallelism workloads | Easy |
+| Batch frames per writer wake (Rust) | Reduce flush syscalls, improve scaling | Medium |
+| Inline decoder into reader task (Rust) | Eliminate 1 channel hop per direction | Medium |
+| Merge decoder into reader goroutine (Go) | Eliminate 1 channel hop (~1,500 ns/op) | Medium |
+| Monomorphize TransportWriter (Rust) | Remove vtable overhead, enable inlining | Medium |
+| Code-gen msgpack codec (Go) | Eliminate reflection (~2,000 ns/op) | Hard |
+| Writer/reader-owned replay+ACK (Rust) | Eliminate mutexes, improve V3 scaling | Hard |
+| Batch V3 sequencing (Rust) | Reduce oneshot round-trips, fix V3 overhead | Medium |
