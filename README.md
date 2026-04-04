@@ -59,8 +59,8 @@ on the wire. No IDL files are required.
 ## Rust implementations
 
 - `adaptivemsg-rust`: runtime + macros (crate name `adaptivemsg`).
-- `adaptivemsg-macros`: proc-macro crate for `#[am::message]` and `#[am::message_handler]`.
-- `adaptivemsg-amgen` (bin `amgen-rs`): Rust -> Go generator.
+  - `macros/`: proc-macro crate (`adaptivemsg-macros`) for `#[am::message]` and `#[am::message_handler]`.
+  - `cmd/amgen/`: Rust → Go generator (bin `amgen-rs`).
 
 ## Go implementations
 
