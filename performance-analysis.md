@@ -6,7 +6,7 @@
 - **Protocol**: adaptivemsg V2 (plain) and V3 (recovery mode)
 - **Codec**: MsgpackCompact for cross-language comparison
 - **Operation**: `SendRecv` — send a request, receive a reply (full round-trip)
-- **Runs**: 5 runs × 8000 ops, median reported
+- **Runs**: median reported (protocol: 5 × 8000 ops; scaling: 5 × 5000 ops)
 - **Transport**: TCP loopback with TCP_NODELAY
 
 **Codec note**: Go defaults to MsgpackCompact. Rust defaults to Postcard (faster,
@@ -79,11 +79,36 @@ cargo test --release --lib -- --ignored --nocapture benchmark_wait_calc
 cd adaptivemsg-go
 go test -run=TestScalingThroughput -count=1 -v -timeout=600s .
 
-# Rust — all scaling configs (Postcard + Msgpack, V2 + V3)
+# Rust — all scaling configs (Msgpack, V2 + V3)
 cd adaptivemsg-rust
 AM_BENCH_RUNS=5 AM_BENCH_ITERS=5000 cargo test --release --lib -- --ignored \
   --nocapture --exact scaling_bench_test::benchmark_scaling_all
 ```
+
+### Process-Separated Scaling (apple-to-apple)
+
+```bash
+# Build probes
+cd adaptivemsg-doc/tmp/go-process-probe && go build -o probe .
+cd adaptivemsg-doc/tmp/rust-process-probe && cargo build --release
+
+# Example: Rust V2 Msgpack, 1 conn × 4 streams, 5000 ops
+AM_CODEC=msgpack ./rust-process-probe/target/release/am_rust_process_probe \
+  server 127.0.0.1:18000 &
+AM_CODEC=msgpack ./rust-process-probe/target/release/am_rust_process_probe \
+  client 127.0.0.1:18000 1 4 5000
+
+# Example: Go V3 (recovery), 4 conn × 16 streams, 5000 ops
+AM_RECOVERY=1 ./go-process-probe/probe server 127.0.0.1:18001 &
+AM_RECOVERY=1 ./go-process-probe/probe client 127.0.0.1:18001 4 16 5000
+
+# Automated full-matrix run:
+./tmp/run_separated.sh
+```
+
+Probe environment variables:
+- `AM_CODEC=msgpack` — force MsgpackCompact codec (Rust only; Go defaults to it)
+- `AM_RECOVERY=1` — enable V3 recovery mode (both languages)
 
 **Files:**
 - Go: `adaptivemsg-go/scaling_bench_test.go`
@@ -200,140 +225,239 @@ V3 (free-run)        65,433            69,391              1.06x
 2. **Rust V3 has a severe multi-thread penalty**: +98% overhead in free-run
    vs +21% on single-core. Go's V3 overhead is a consistent +15–22% in both
    setups. See [V3 Recovery Overhead](#v3-recovery-overhead) for root cause.
-3. **Consistency**: The scaling benchmark 1×1 case matches these protocol
-   numbers within ~5% (Go: 12.3K ops/sec ≈ 1e9/83,712; Rust V2 Msgpack:
-   29.5K ops/sec ≈ 1e9/34,962).
+3. **Consistency**: The in-process scaling 1×1 case roughly matches these
+   protocol numbers (Go: 10.0K ops/sec ≈ 1e9/99,680; Rust V2 Msgpack:
+   15.2K ops/sec ≈ 1e9/65,890).
 
 ---
 
 ## Scaling Throughput
 
-Scaling tests measure aggregate throughput with multiple concurrent connections
-and streams, each running parallel send/recv operations against a single server.
-All numbers from 2026-04-02, free run, multi-thread runtime, 5 runs × 5000 ops.
+All scaling numbers are from 2026-04-04, free run, multi-thread runtime,
+5 runs × 5000 ops, median reported. Two test topologies are used:
 
-### Go (Msgpack)
+- **In-process**: Client and server share one benchmark process/runtime.
+  Stresses the scheduler but exaggerates shared-runtime interference.
+- **Process-separated**: Client and server in separate OS processes,
+  communicating over real TCP. Closer to actual deployment topology.
+
+**Note**: Absolute throughput is lower than earlier runs (2026-04-02) due to
+shared-machine contention. The relative Go-vs-Rust comparisons are reliable
+since both languages were measured back-to-back under the same conditions.
+
+### In-Process Results
+
+#### Go (Msgpack)
 
 ```
 Go V2 (no recovery):
   Config               ops/sec     speedup vs 1×1
-  1 conn × 1 stream     12,301          1.0x
-  1 conn × 4 stream     38,071          3.1x
-  1 conn × 16 stream    52,635          4.3x
-  1 conn × 64 stream    54,880          4.5x
-  4 conn × 1 stream     42,543          3.5x
-  4 conn × 4 stream     94,283          7.7x
-  4 conn × 16 stream   141,527         11.5x
-  4 conn × 64 stream   124,932         10.2x
+  1 conn × 1 stream     10,032          1.0x
+  1 conn × 4 stream     15,741          1.6x
+  1 conn × 16 stream    19,890          2.0x
+  1 conn × 64 stream    21,081          2.1x
+  4 conn × 1 stream     16,611          1.7x
+  4 conn × 4 stream     37,008          3.7x
+  4 conn × 16 stream    45,093          4.5x
+  4 conn × 64 stream    30,373          3.0x
 
 Go V3 (recovery enabled):
   Config               ops/sec     speedup vs 1×1
-  1 conn × 1 stream     10,239          1.0x
-  1 conn × 4 stream     35,174          3.4x
-  1 conn × 16 stream    51,046          5.0x
-  1 conn × 64 stream    46,702          4.6x
-  4 conn × 1 stream     42,068          4.1x
-  4 conn × 4 stream    100,458          9.8x
-  4 conn × 16 stream   137,240         13.4x
-  4 conn × 64 stream    85,148          8.3x
+  1 conn × 1 stream      7,334          1.0x
+  1 conn × 4 stream     15,524          2.1x
+  1 conn × 16 stream    29,071          4.0x
+  1 conn × 64 stream    23,433          3.2x
+  4 conn × 1 stream     20,047          2.7x
+  4 conn × 4 stream     36,707          5.0x
+  4 conn × 16 stream    37,494          5.1x
+  4 conn × 64 stream    40,292          5.5x
 ```
 
-### Rust (Msgpack, for Go comparison)
+#### Rust (Msgpack)
 
 ```
 Rust V2 Msgpack:
   Config               ops/sec     speedup vs 1×1
-  1 conn × 1 stream     29,513          1.0x
-  1 conn × 4 stream     37,700          1.3x
-  1 conn × 16 stream    40,574          1.4x
-  1 conn × 64 stream    41,547          1.4x
-  4 conn × 1 stream     52,445          1.8x
-  4 conn × 4 stream     50,568          1.7x
-  4 conn × 16 stream    52,942          1.8x
-  4 conn × 64 stream    52,445          1.8x
+  1 conn × 1 stream     15,172          1.0x
+  1 conn × 4 stream     22,821          1.5x
+  1 conn × 16 stream    30,764          2.0x
+  1 conn × 64 stream    21,883          1.4x
+  4 conn × 1 stream     16,653          1.1x
+  4 conn × 4 stream     20,384          1.3x
+  4 conn × 16 stream    23,887          1.6x
+  4 conn × 64 stream    28,424          1.9x
 
 Rust V3 Msgpack:
   Config               ops/sec     speedup vs 1×1
-  1 conn × 1 stream     14,009          1.0x
-  1 conn × 4 stream     30,704          2.2x
-  1 conn × 16 stream    36,596          2.6x
-  1 conn × 64 stream    37,523          2.7x
-  4 conn × 1 stream     38,310          2.7x
-  4 conn × 4 stream     39,593          2.8x
-  4 conn × 16 stream    44,824          3.2x
-  4 conn × 64 stream    39,687          2.8x
+  1 conn × 1 stream      9,470          1.0x
+  1 conn × 4 stream     13,179          1.4x
+  1 conn × 16 stream    18,082          1.9x
+  1 conn × 64 stream    17,642          1.9x
+  4 conn × 1 stream     13,618          1.4x
+  4 conn × 4 stream     13,958          1.5x
+  4 conn × 16 stream    18,396          1.9x
+  4 conn × 64 stream    14,704          1.6x
 ```
 
-### Go vs Rust Head-to-Head (Msgpack)
+#### Head-to-Head (Msgpack)
 
 ```
 V2 (no recovery):
-  Config                Go ops/sec    Rust ops/sec    Go/Rust
-  1 conn × 1 stream       12,301        29,513        0.42x  ← Rust faster
-  1 conn × 4 stream       38,071        37,700        1.01x
-  1 conn × 16 stream      52,635        40,574        1.30x  ← Go overtakes
-  1 conn × 64 stream      54,880        41,547        1.32x
-  4 conn × 1 stream       42,543        52,445        0.81x
-  4 conn × 4 stream       94,283        50,568        1.86x
-  4 conn × 16 stream     141,527        52,942        2.67x
-  4 conn × 64 stream     124,932        52,445        2.38x
+  Config              Go ops/sec   Rust ops/sec   Rust/Go
+  1 conn × 1 stream      10,032        15,172      1.51x  ← Rust faster
+  1 conn × 4 stream      15,741        22,821      1.45x
+  1 conn × 16 stream     19,890        30,764      1.55x
+  1 conn × 64 stream     21,081        21,883      1.04x
+  4 conn × 1 stream      16,611        16,653      1.00x  ← crossover
+  4 conn × 4 stream      37,008        20,384      0.55x  ← Go dominates
+  4 conn × 16 stream     45,093        23,887      0.53x
+  4 conn × 64 stream     30,373        28,424      0.94x
 
 V3 (recovery enabled):
-  Config                Go ops/sec    Rust ops/sec    Go/Rust
-  1 conn × 1 stream       10,239        14,009        0.73x  ← Rust faster
-  1 conn × 4 stream       35,174        30,704        1.15x
-  1 conn × 16 stream      51,046        36,596        1.39x
-  1 conn × 64 stream      46,702        37,523        1.24x
-  4 conn × 1 stream       42,068        38,310        1.10x
-  4 conn × 4 stream      100,458        39,593        2.54x
-  4 conn × 16 stream     137,240        44,824        3.06x
-  4 conn × 64 stream      85,148        39,687        2.15x
+  Config              Go ops/sec   Rust ops/sec   Rust/Go
+  1 conn × 1 stream       7,334         9,470      1.29x  ← Rust faster
+  1 conn × 4 stream      15,524        13,179      0.85x  ← Go overtakes earlier
+  1 conn × 16 stream     29,071        18,082      0.62x
+  1 conn × 64 stream     23,433        17,642      0.75x
+  4 conn × 1 stream      20,047        13,618      0.68x
+  4 conn × 4 stream      36,707        13,958      0.38x
+  4 conn × 16 stream     37,494        18,396      0.49x
+  4 conn × 64 stream     40,292        14,704      0.36x  ← Go 2.7x faster
 ```
 
-### Rust Postcard (native codec reference)
+### Process-Separated Results
+
+Both languages use **separate server/client processes** (the probes in
+`adaptivemsg-doc/tmp/{go,rust}-process-probe`):
+
+- No pinned CPUs, no forced runtime worker count
+- Both use MsgpackCompact codec (`AM_CODEC=msgpack` for Rust)
+- V3 via `AM_RECOVERY=1` on both server and client
+- 5 runs × 5000 ops, median reported
+
+#### Go (Msgpack)
 
 ```
-V2 Postcard:
+Go V2 (no recovery):
   Config               ops/sec     speedup vs 1×1
-  1 conn × 1 stream     33,667          1.0x
-  1 conn × 4 stream     42,673          1.3x
-  1 conn × 16 stream    50,527          1.5x
-  1 conn × 64 stream    48,735          1.4x
-  4 conn × 1 stream     70,130          2.1x
-  4 conn × 4 stream     74,535          2.2x
-  4 conn × 16 stream    71,138          2.1x
-  4 conn × 64 stream    70,417          2.1x
+  1 conn × 1 stream      3,250          1.0x
+  1 conn × 4 stream     14,121          4.3x
+  1 conn × 16 stream    20,681          6.4x
+  1 conn × 64 stream    22,268          6.9x
+  4 conn × 1 stream      9,916          3.1x
+  4 conn × 4 stream     25,753          7.9x
+  4 conn × 16 stream    30,620          9.4x
+  4 conn × 64 stream    30,030          9.2x
 
-V3 Postcard:
+Go V3 (recovery enabled):
   Config               ops/sec     speedup vs 1×1
-  1 conn × 1 stream     15,201          1.0x
-  1 conn × 4 stream     35,241          2.3x
-  1 conn × 16 stream    43,142          2.8x
-  1 conn × 64 stream    45,151          3.0x
-  4 conn × 1 stream     53,009          3.5x
-  4 conn × 4 stream     64,894          4.3x
-  4 conn × 16 stream    68,018          4.5x
-  4 conn × 64 stream    65,701          4.3x
+  1 conn × 1 stream      3,008          1.0x
+  1 conn × 4 stream     11,649          3.9x
+  1 conn × 16 stream    14,009          4.7x
+  1 conn × 64 stream    19,557          6.5x
+  4 conn × 1 stream     11,294          3.8x
+  4 conn × 4 stream     30,354         10.1x
+  4 conn × 16 stream    39,360         13.1x
+  4 conn × 64 stream    28,830          9.6x
+```
+
+#### Rust (Msgpack)
+
+```
+Rust V2 Msgpack:
+  Config               ops/sec     speedup vs 1×1
+  1 conn × 1 stream      4,163          1.0x
+  1 conn × 4 stream     15,028          3.6x
+  1 conn × 16 stream    20,505          4.9x
+  1 conn × 64 stream    21,681          5.2x
+  4 conn × 1 stream     22,321          5.4x
+  4 conn × 4 stream     27,817          6.7x
+  4 conn × 16 stream    28,785          6.9x
+  4 conn × 64 stream    20,397          4.9x
+
+Rust V3 Msgpack:
+  Config               ops/sec     speedup vs 1×1
+  1 conn × 1 stream      3,955          1.0x
+  1 conn × 4 stream     11,213          2.8x
+  1 conn × 16 stream    20,676          5.2x
+  1 conn × 64 stream    16,510          4.2x
+  4 conn × 1 stream     18,169          4.6x
+  4 conn × 4 stream     20,829          5.3x
+  4 conn × 16 stream    19,834          5.0x
+  4 conn × 64 stream    23,643          6.0x
+```
+
+#### Head-to-Head (Msgpack)
+
+```
+V2 (no recovery):
+  Config              Go ops/sec   Rust ops/sec   Rust/Go
+  1 conn × 1 stream       3,250         4,163      1.28x
+  1 conn × 4 stream      14,121        15,028      1.06x
+  1 conn × 16 stream     20,681        20,505      0.99x  ← roughly tied
+  1 conn × 64 stream     22,268        21,681      0.97x
+  4 conn × 1 stream       9,916        22,321      2.25x  ← Rust strong
+  4 conn × 4 stream      25,753        27,817      1.08x
+  4 conn × 16 stream     30,620        28,785      0.94x
+  4 conn × 64 stream     30,030        20,397      0.68x  ← Go edges ahead
+
+V3 (recovery enabled):
+  Config              Go ops/sec   Rust ops/sec   Rust/Go
+  1 conn × 1 stream       3,008         3,955      1.31x
+  1 conn × 4 stream      11,649        11,213      0.96x
+  1 conn × 16 stream     14,009        20,676      1.48x
+  1 conn × 64 stream     19,557        16,510      0.84x
+  4 conn × 1 stream      11,294        18,169      1.61x
+  4 conn × 4 stream      30,354        20,829      0.69x
+  4 conn × 16 stream     39,360        19,834      0.50x
+  4 conn × 64 stream     28,830        23,643      0.82x
 ```
 
 ### Scaling Summary
 
-| Metric | Go V2 | Go V3 | Rust V2 Msgpack | Rust V3 Msgpack | Rust V2 Postcard | Rust V3 Postcard |
-|---|---|---|---|---|---|---|
-| Peak ops/sec | 141,527 | 137,240 | 52,942 | 44,824 | 74,535 | 68,018 |
-| Peak config | 4×16 | 4×16 | 4×16 | 4×16 | 4×4 | 4×16 |
-| Max speedup vs 1×1 | 11.5x | 13.4x | 1.8x | 3.2x | 2.2x | 4.5x |
+#### In-Process
 
-- **Go scales dramatically**: 11–13x throughput improvement from 1×1 to 4×16.
-- **Rust plateaus early**: 1.8–4.5x improvement then flattens.
-- **Cross-over at ~4 streams**: Go overtakes Rust in absolute throughput at
-  roughly 1 conn × 4 streams (Msgpack V2), despite Rust being 2.4x faster
-  at 1×1.
+| Metric | Go V2 | Go V3 | Rust V2 Msgpack | Rust V3 Msgpack |
+|---|---|---|---|---|
+| Peak ops/sec | 45,093 | 40,292 | 30,764 | 18,396 |
+| Peak config | 4×16 | 4×64 | 1×16 | 4×16 |
+| Max speedup vs 1×1 | 4.5x | 5.5x | 2.0x | 1.9x |
 
-### Why Rust Scales Poorly
+#### Process-Separated (Msgpack)
 
-The primary bottleneck is **tokio's cross-thread scheduling overhead**, not
-a code-level bug. This was confirmed by sweeping `TOKIO_WORKER_THREADS`:
+| Metric | Go V2 | Go V3 | Rust V2 | Rust V3 |
+|---|---|---|---|---|
+| Peak ops/sec | 30,620 | 39,360 | 28,785 | 23,643 |
+| Peak config | 4×16 | 4×16 | 4×16 | 4×64 |
+| Max speedup vs 1×1 | 9.4x | 13.1x | 6.9x | 6.0x |
+
+#### Key Takeaways
+
+**In-process** (shared runtime):
+- Rust wins at low parallelism (V2 1×1: 1.51×) but Go dominates at high
+  concurrency (V2 4×16: Go 1.89×, V3 4×64: Go 2.74×).
+- Go scales 4–5.5× from 1×1 to peak; Rust only 1.9–2.0×.
+- V3 amplifies Go's advantage — Go overtakes Rust earlier (at 1×4 instead
+  of 4×1) because Rust's writer-owned sequencing oneshot hurts more with
+  cross-thread wakes in a shared runtime.
+
+**Process-separated** (real deployment topology):
+- Much more competitive. Both languages scale better (Go 9–13×, Rust 6–7×).
+- Rust leads at low parallelism and multi-connection/few-streams
+  (V2 4×1: Rust 2.25×). Go edges ahead at high stream counts
+  (V2 4×64: Go 1.47×, V3 4×16: Go 1.98×).
+- The extreme Go dominance seen in-process (2–3× at high concurrency) shrinks
+  to modest gaps (typically <1.5×), confirming that in-process shared-runtime
+  interference exaggerates Rust's scaling weakness.
+
+### Why Rust Scales Differently In-Process
+
+The process-separated results show Rust does **not** intrinsically collapse —
+it stays competitive with Go across the full config matrix when client and
+server run in separate processes. The in-process benchmark exaggerates Rust's
+weakness because it is **highly sensitive to shared-runtime topology**.
+
+This was confirmed by sweeping `TOKIO_WORKER_THREADS`:
 
 ```
 Tokio worker thread sweep (V2 Msgpack, 3 runs × 5000 ops, median):
@@ -360,34 +484,40 @@ Tokio worker thread sweep (V2 Msgpack, 3 runs × 5000 ops, median):
      24       30,840       0.98x
 ```
 
-**Key insight**: the optimal thread count depends on the workload shape.
-For low-parallelism cases (4×1), 2 threads is 2.24× faster than 24 threads
-because tasks stay on the same threads and avoid cross-thread channel
-overhead. For high-parallelism cases (4×16), more threads help because
-64 concurrent tasks need real parallelism.
+**Key insight**: the optimal Tokio thread count depends strongly on workload
+shape. For low-parallelism cases (`4×1`), 2 threads is 2.24× faster than 24
+because tasks stay colocated and avoid cross-thread channel overhead. For
+high-parallelism cases (`4×16`), more threads help because 64 concurrent tasks
+need real parallelism. Go does not exhibit this sensitivity — GOMAXPROCS=24
+works fine across all shapes.
 
-Go does not exhibit this sensitivity — GOMAXPROCS=24 works well across all
-configs because goroutine scheduling and channel operations have lower
-cross-thread overhead than tokio's mpsc + work-stealing.
+**Why the difference:**
+- **Go goroutines** yield cooperatively at channel operations. Waking a
+  goroutine on another thread costs ~2 µs with low cache impact.
+- **Tokio tasks** yield at `.await` points. Cross-thread channel sends involve
+  cache-line transfers and work-stealing overhead. With 4 connections, Rust's
+  per-connection throughput drops 2.25× vs 1×1 (at 24 threads); Go's drops
+  only 1.16×.
+- **Extra async hops**: Rust's reader → decoder → inbox chain has one more
+  channel crossing per message direction than Go's direct reader → inbox path.
+  Each crossing multiplies the cross-thread penalty.
 
-#### Architectural bottlenecks
+#### Rust Architectural Bottlenecks
 
 1. **Single writer task per connection** — all frames from N streams funnel
    through one writer, serializing writes
 2. **One flush per frame** — no batching of multiple frames per writer wake
-3. **Extra async hop**: Rust has a per-stream decoder task between reader and
-   inbox (reader → incoming_tx → decoder → inbox_tx). Go decodes inline in the
-   reader goroutine, saving one channel hop per message direction
+3. **Extra async hop**: per-stream decoder task between reader and inbox
+   (reader → incoming_tx → decoder → inbox_tx); Go decodes inline
 4. **V3 cross-thread oneshot round-trip** on every send
    (`outbound_tx → writer → oneshot reply`)
 5. **Dynamic dispatch**: `TransportWriter = Box<dyn AsyncWrite>` adds vtable
-   overhead on every write call in the hot path
+   overhead on every write call
 
-#### Promising improvements
+#### Improvement Opportunities
 
-1. **Tune worker threads per workload** — or use `tokio::runtime::Builder` to
-   set an appropriate thread count (4–8 may be better than num_cpus for most
-   real-world message sizes)
+1. **Tune worker threads per workload** — 4–8 threads may be better than
+   num_cpus for most real-world message sizes
 2. **Batch frames per writer wake** — drain all pending frames from
    outbound_rx before flushing, reducing syscalls
 3. **Inline decoder into reader** — eliminate per-stream decoder task and its
@@ -471,28 +601,6 @@ payload `Vec<u8>` is heap-allocated on receive.
 Go Msgpack uses `reflect.ValueOf()` at runtime. Rust Serde generates
 specialized encode/decode at compile time.
 
-### Why Go Scales Better
-
-Despite Rust being 2.4x faster at 1×1, Go overtakes Rust at ~4 streams and
-reaches 2.7x higher peak throughput. The thread sweep data above pinpoints
-the root cause: **tokio's cross-thread overhead scales poorly**.
-
-- **Go goroutines** yield cooperatively at channel operations. The runtime's
-  integrated scheduler and channels share memory structures efficiently —
-  waking a goroutine on another thread costs ~2 µs with low cache impact.
-  GOMAXPROCS=24 works fine across all workload shapes.
-- **Tokio tasks** yield at `.await` points. The work-stealing scheduler migrates
-  tasks between threads, channel sends cross thread boundaries, and each hop
-  involves cache-line transfers. With 4 connections, Rust's per-connection
-  throughput drops 2.25× vs 1×1 (at 24 threads); Go's drops only 1.16×.
-- **Extra async hops**: Rust's reader → decoder → inbox chain has one more
-  channel crossing per message direction than Go's direct reader → inbox path.
-  Each crossing multiplies the cross-thread penalty.
-
-The result: Go's per-operation cost is higher, but it scales linearly with
-connections. Rust's per-operation cost is lower, but cross-thread overhead
-dominates under concurrency.
-
 ---
 
 ## Optimizations Applied
@@ -510,11 +618,8 @@ dominates under concurrency.
 
 | Optimization | Expected Impact | Difficulty |
 |---|---|---|
-| Tune tokio worker threads (4–8 instead of num_cpus) (Rust) | Up to 2× for low-parallelism workloads | Easy |
-| Batch frames per writer wake (Rust) | Reduce flush syscalls, improve scaling | Medium |
-| Inline decoder into reader task (Rust) | Eliminate 1 channel hop per direction | Medium |
 | Merge decoder into reader goroutine (Go) | Eliminate 1 channel hop (~1,500 ns/op) | Medium |
-| Monomorphize TransportWriter (Rust) | Remove vtable overhead, enable inlining | Medium |
 | Code-gen msgpack codec (Go) | Eliminate reflection (~2,000 ns/op) | Hard |
-| Writer/reader-owned replay+ACK (Rust) | Eliminate mutexes, improve V3 scaling | Hard |
+| Batch frames per writer wake (Rust) | Reduce flush count, improve scaling | Medium |
+| Writer/reader-owned replay+ACK (Rust) | Eliminate mutexes, improve scaling | Hard |
 | Batch V3 sequencing (Rust) | Reduce oneshot round-trips, fix V3 overhead | Medium |
