@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	am "adaptivemsg"
+	am "github.com/adaptivemsg/adaptivemsg-go"
 )
 
 type EchoReq struct {
