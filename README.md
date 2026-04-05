@@ -24,6 +24,7 @@
     - [Explicit override](#explicit-override)
   - [Code generation (no IDL)](#code-generation-no-idl)
     - [Example: Go server -\> Rust clients](#example-go-server---rust-clients)
+    - [Example: Rust server -\> Go clients](#example-rust-server---go-clients)
   - [Compatibility rules](#compatibility-rules)
   - [Observability and debuggability](#observability-and-debuggability)
     - [Shared diagnostics model](#shared-diagnostics-model)

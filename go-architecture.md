@@ -4,16 +4,16 @@
 
 All `go` spawns in the core runtime:
 
-| # | Goroutine | File | Scope | Input Channels | Purpose |
-|---|-----------|------|-------|----------------|---------|
-| A | decodeLoop | connection.go:265 | Per-stream | `incoming` ([]byte) | Decode envelope, route to handler or inbox |
-| B | handlerLoop | connection.go:263 | Per-stream | `handlerCh` (handlerJob) | Execute registered handlers, send replies |
-| C | writerLoop | connection.go:109 | Per-connection | `outbound` (outboundFrame) | Write frames to TCP |
-| D | readerLoop | connection.go:110 | Per-connection | TCP socket | Read frames, send raw bytes to decoder |
-| E | recoveryWriterLoop | recovery\_runtime.go | Per-connection | `outbound`, recovery state | Write frames with seq tracking, ACKs, pings |
-| F | recoveryReaderLoop | recovery\_runtime.go | Per-connection | TCP socket | Read frames with heartbeat timeout |
-| G | reconnectLoop | recovery\_runtime.go:362 | Per-client | Timer | Reconnect with exponential backoff |
-| H | handleConn | server.go:116 | Per-connection | TCP socket | Handshake and connection setup |
+| #   | Goroutine          | File                     | Scope          | Input Channels             | Purpose                                     |
+| --- | ------------------ | ------------------------ | -------------- | -------------------------- | ------------------------------------------- |
+| A   | decodeLoop         | connection.go:265        | Per-stream     | `incoming` ([]byte)        | Decode envelope, route to handler or inbox  |
+| B   | handlerLoop        | connection.go:263        | Per-stream     | `handlerCh` (handlerJob)   | Execute registered handlers, send replies   |
+| C   | writerLoop         | connection.go:109        | Per-connection | `outbound` (outboundFrame) | Write frames to TCP                         |
+| D   | readerLoop         | connection.go:110        | Per-connection | TCP socket                 | Read frames, send raw bytes to decoder      |
+| E   | recoveryWriterLoop | recovery\_runtime.go     | Per-connection | `outbound`, recovery state | Write frames with seq tracking, ACKs, pings |
+| F   | recoveryReaderLoop | recovery\_runtime.go     | Per-connection | TCP socket                 | Read frames with heartbeat timeout          |
+| G   | reconnectLoop      | recovery\_runtime.go:362 | Per-client     | Timer                      | Reconnect with exponential backoff          |
+| H   | handleConn         | server.go:116            | Per-connection | TCP socket                 | Handshake and connection setup              |
 
 ## Channel Definitions
 
@@ -78,24 +78,24 @@ Same 2-hop structure. recoveryReaderLoop (F) replaces readerLoop (D) and adds:
 
 ### Per Connection (V2, 1 stream, with handlers)
 
-| Goroutine | Count |
-|-----------|-------|
-| writerLoop (C) | 1 |
-| readerLoop (D) | 1 |
-| decodeLoop (A) | 1 per stream |
+| Goroutine       | Count          |
+| --------------- | -------------- |
+| writerLoop (C)  | 1              |
+| readerLoop (D)  | 1              |
+| decodeLoop (A)  | 1 per stream   |
 | handlerLoop (B) | 0-1 per stream |
-| **Total** | **3-4** |
+| **Total**       | **3-4**        |
 
 ### Per Connection (V3, 1 stream, with handlers)
 
-| Goroutine | Count |
-|-----------|-------|
-| recoveryWriterLoop (E) | 1 |
-| recoveryReaderLoop (F) | 1 |
-| decodeLoop (A) | 1 per stream |
-| handlerLoop (B) | 0-1 per stream |
-| reconnectLoop (G) | 0-1 (client only) |
-| **Total** | **3-5** |
+| Goroutine              | Count             |
+| ---------------------- | ----------------- |
+| recoveryWriterLoop (E) | 1                 |
+| recoveryReaderLoop (F) | 1                 |
+| decodeLoop (A)         | 1 per stream      |
+| handlerLoop (B)        | 0-1 per stream    |
+| reconnectLoop (G)      | 0-1 (client only) |
+| **Total**              | **3-5**           |
 
 ## Key Design Properties
 

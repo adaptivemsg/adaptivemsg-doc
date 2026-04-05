@@ -622,9 +622,9 @@ specialized encode/decode at compile time.
 
 ### Rust
 
-| Optimization                                  | Status |
-| --------------------------------------------- | ------ |
-| Batched-flush V2 plain writer loop            | ✅ Done |
+| Optimization                       | Status |
+| ---------------------------------- | ------ |
+| Batched-flush V2 plain writer loop | ✅ Done |
 
 ### Remaining Opportunities
 
