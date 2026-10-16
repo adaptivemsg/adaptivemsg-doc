@@ -473,8 +473,9 @@ import hello "github.com/adaptivemsg/hello-server-rust/api/hello"
 ```
 
 ```go
-reply := &hello.HelloReply{}
-err := conn.SendRecv(&hello.HelloRequest{Who: "John", Question: "who are you"}, reply)
+reply, err := conn.SendRecv[*hello.HelloReply](
+    &hello.HelloRequest{Who: "John", Question: "who are you"},
+)
 ```
 
 ## Compatibility rules

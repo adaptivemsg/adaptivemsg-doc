@@ -64,7 +64,7 @@ dispatchMessage(core, raw)
     │
     └── no handler → core.inboxQ()           ← Hop 2b: rawMessage
             ↓
-        Caller's stream.Recv()
+        Caller's stream.Recv[T]()
 ```
 
 ### Recovery (V3)

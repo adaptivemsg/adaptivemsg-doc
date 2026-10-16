@@ -1,4 +1,4 @@
-# Short-Lived API (V2)
+# Short-Lived API
 
 A thin convenience layer on top of the existing connection-based API. One
 `SendRecv` round-trip over a freshly dialled connection that is closed
@@ -9,155 +9,92 @@ immediately after the reply arrives.
 Many use-cases only need a single request-reply exchange (health checks, CLI
 tools, one-shot RPC). The current API requires the caller to manage Client,
 Connection, and Close explicitly. The short-lived API collapses that into a
-builder chain: `Once(addr)` → optional config → `SendRecv(req)`.
+single client operation: configure `Client` → `SendRecv[T](addr, req)`.
 
 ## Go API
 
 ### Minimal form
 
 ```go
-reply, err := am.SendRecvAs[*EchoReply](am.Once("tcp://127.0.0.1:8080"), &EchoReq{Text: "hello"})
+reply, err := am.NewClient().SendRecv[*EchoReply](
+    "tcp://127.0.0.1:8080",
+    &EchoReq{Text: "hello"},
+)
 ```
 
 ### With options
 
 ```go
-reply, err := am.SendRecvAs[*EchoReply](
-    am.Once("tcp://127.0.0.1:8080").
-        WithTimeout(5*time.Second).
-        WithCodecs(am.MsgpackCompact),
-    &EchoReq{Text: "hello"},
-)
+reply, err := am.NewClient().
+    WithTimeout(5*time.Second).
+    WithCodecs(am.CodecMsgpackCompact).
+    SendRecv[*EchoReply](
+        "tcp://127.0.0.1:8080",
+        &EchoReq{Text: "hello"},
+    )
 ```
 
-### Types
+### Method
 
 ```go
-// Link is the sealed interface for SendRecvAs targets.
-// Connection, Stream, and OnceConn implement Link.
-type Link interface {
-    isLink()
-}
-
-// OnceConn is a builder for a short-lived connection.
-// Created by Once(addr) and configured with builder methods.
-// Passed to SendRecvAs as a Link target.
-type OnceConn struct {
-    addr    string
-    timeout time.Duration // default 5s
-    codecs  []CodecID
-}
-
-// Once returns a builder for a short-lived connection to addr.
-func Once(addr string) *OnceConn {
-    return &OnceConn{addr: addr, timeout: 5 * time.Second}
-}
-
-func (o *OnceConn) WithTimeout(d time.Duration) *OnceConn {
-    o.timeout = d
-    return o
-}
-
-func (o *OnceConn) WithCodecs(codecs ...CodecID) *OnceConn {
-    o.codecs = append([]CodecID(nil), codecs...)
-    return o
-}
-```
-
-`SendRecvAs[R]` accepts any `Link` — a sealed interface implemented by
-`Connection`, `Stream`, and `OnceConn`. When the target is `*OnceConn`, it
-dials, sends, receives, and closes. The sealed `isLink()` method prevents
-external implementations.
-
-### Implementation sketch
-
-```go
-func SendRecvAs[T any](v Link, msg Message) (T, error) {
-    if o, ok := v.(*OnceConn); ok {
-        client := NewClient().WithTimeout(o.timeout)
-        if len(o.codecs) > 0 {
-            client = client.WithCodecs(o.codecs...)
-        }
-        conn, err := client.Connect(o.addr)
-        if err != nil {
-            var zero T
-            return zero, err
-        }
-        defer conn.Close()
-        stream := StreamAs[T](conn)
-        stream.SetRecvTimeout(o.timeout)
-        return stream.SendRecv(msg)
+func (c *Client) SendRecv[T any](addr string, msg Message) (T, error) {
+    var zero T
+    conn, err := c.Connect(addr)
+    if err != nil {
+        return zero, err
     }
-    stream := StreamAs[T](v)
-    return stream.SendRecv(msg)
+    defer conn.Close()
+    conn.SetRecvTimeout(c.timeout)
+    return conn.SendRecv[T](msg)
 }
 ```
+
+Go 1.27 generic methods let `Client` own the typed terminal operation directly.
+No package-level helper, sealed `Link` interface, or one-shot builder type is
+needed.
 
 ## Rust API
 
 ### Minimal form
 
 ```rust
-let reply: EchoReply = am::once("tcp://127.0.0.1:8080")
-    .send_recv(EchoReq { text: "hello".into() })
+let reply: EchoReply = Client::new()
+    .send_recv(
+        "tcp://127.0.0.1:8080",
+        EchoReq { text: "hello".into() },
+    )
     .await?;
 ```
 
 ### With options
 
 ```rust
-let reply: EchoReply = am::once("tcp://127.0.0.1:8080")
-    .with_timeout(Duration::from_secs(10))
+let reply: EchoReply = Client::new()
+    .with_timeout(Duration::from_secs(5))
     .with_codecs(&[CodecMsgpackCompact])
-    .send_recv(EchoReq { text: "hello".into() })
+    .send_recv(
+        "tcp://127.0.0.1:8080",
+        EchoReq { text: "hello".into() },
+    )
     .await?;
 ```
 
-### Types
+### Method
 
 ```rust
-/// Builder for a short-lived SendRecv call.
-pub struct OnceConn {
-    addr: String,
-    timeout: Duration,            // default 5s
-    codecs: Option<Vec<CodecID>>, // None = client default
-}
-
-/// Create a builder that will dial addr, perform one send_recv,
-/// and close the connection.
-pub fn once(addr: &str) -> OnceConn {
-    OnceConn {
-        addr: addr.to_string(),
-        timeout: Duration::from_secs(5),
-        codecs: None,
-    }
-}
-
-impl OnceConn {
-    pub fn with_timeout(mut self, d: Duration) -> Self {
-        self.timeout = d;
-        self
-    }
-
-    pub fn with_codecs(mut self, codecs: &[CodecID]) -> Self {
-        self.codecs = Some(codecs.to_vec());
-        self
-    }
-
-    /// Dial, send one request, receive one reply, close.
+impl Client {
     pub async fn send_recv<Req: Message, Rep: MessageDecode + 'static>(
-        self,
+        &self,
+        addr: &str,
         req: Req,
     ) -> Result<Rep, Error> {
-        let mut client = Client::new().with_timeout(self.timeout);
-        if let Some(ref codecs) = self.codecs {
-            client = client.with_codecs(codecs);
+        let conn = self.connect(addr).await?;
+        if let Some(timeout) = self.timeout {
+            conn.set_recv_timeout(timeout);
         }
-        let conn = client.connect(&self.addr).await?;
-        conn.set_recv_timeout(self.timeout);
-        let reply: Rep = conn.send_recv(req).await?;
+        let reply = conn.send_recv(req).await;
         conn.close();
-        Ok(reply)
+        reply
     }
 }
 ```
@@ -166,14 +103,12 @@ impl OnceConn {
 
 | Decision | Rationale |
 |----------|-----------|
-| Builder pattern (both languages) | One API surface; simple case is short, options chain naturally. |
-| Go: free function `SendRecvAs(Once(...), req)` | Reuses the existing generic free function; Go cannot have generic methods on structs. |
-| Rust: terminal method `once(...).send_recv(req)` | Idiomatic Rust builder; generic methods on structs are allowed. |
-| No recovery (V2 only) | A one-shot connection has nothing to resume. Recovery adds overhead with zero benefit here. |
-| Default 5 s timeout | Long enough for most one-shot RPCs; callers can override. The timeout covers both connect and recv. |
+| Go: `Client.SendRecv[T](addr, req)` | Reuses all existing client configuration without another public type or duplicated `WithX` methods. |
+| Rust: `Client::send_recv(addr, req)` | Mirrors Go while allowing the reply type to be inferred from context. |
+| Recovery disabled by default | `Client.SendRecv` honors explicit recovery configuration, although it rarely benefits a one-shot call. |
+| No default timeout | Matches `Client.Connect`; `WithTimeout` applies to both connect and reply wait for this operation. |
 | Uses default stream (stream 0) | Only one message exchange, no need for extra streams. |
 | Connection closed after reply | `defer conn.Close()` (Go) / `conn.close()` (Rust) guarantees cleanup even on error. |
-| `send_recv` consumes `self` (Rust) | Enforces one-shot semantics — the builder cannot be reused. |
 
 ## What this does NOT do
 
@@ -181,12 +116,11 @@ impl OnceConn {
   If you need repeated calls to the same server, use the normal
   `Client.Connect` API.
 - **Streaming** — this is strictly one request, one reply.
-- **Recovery** — V3 recovery is not applied; there is no reconnect.
 
 ## Error semantics
 
 Errors returned are the same as the underlying `Client.Connect` and
-`SendRecvAs` / `send_recv` calls. The caller may see:
+`SendRecv` / `send_recv` calls. The caller may see:
 
 - **Connect failure** — server unreachable, DNS resolution error, connection
   refused.
@@ -203,8 +137,8 @@ Failure codes follow the shared vocabulary defined in the main
 
 ## Cost model
 
-Each call — `SendRecvAs(Once(...), req)` in Go, `once(...).send_recv(req)` in
-Rust — pays:
+Each call — `Client.SendRecv[T](addr, req)` in Go and
+`Client::send_recv(addr, req)` in Rust — pays:
 
 1. TCP connect (SYN/SYN-ACK/ACK)
 2. Handshake (codec negotiation, 12 + N bytes + 12 bytes)
@@ -218,7 +152,7 @@ connection.
 
 ### Comparison with RESTful HTTP
 
-| Step | adaptivemsg `Once` | HTTP/1.1 REST |
+| Step | adaptivemsg `Client.SendRecv` | HTTP/1.1 REST |
 |------|-------------------|---------------|
 | TCP connect | SYN/SYN-ACK/ACK (1 RTT) | Same |
 | TLS handshake | — (not applicable) | 1–2 RTT (TLS 1.2: 2, TLS 1.3: 1) |
