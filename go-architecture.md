@@ -17,7 +17,7 @@ All `go` spawns in the core runtime:
 
 ## Channel Definitions
 
-Created in `makeStreamLocked()` (connection.go:242-250):
+Created in `newStreamCtx()` before the stream is published:
 
 ```go
 // Hop 1: reader → decoder (raw bytes)
@@ -49,20 +49,20 @@ TCP Socket
     ↓
 [readerLoop (D)]  — readFrame()
     ↓
-streamCtx.stream.core.incomingQ(payload)    ← Hop 1: []byte
+acceptFrame() → stream.incomingQ(payload)   ← Hop 1: []byte
     ↓
-[decodeLoop (A)]  — <-core.incoming
+[decodeLoop (A)]  — <-stream.incoming
     ↓
 newRawMessageFromPayload(codecID, payload)  → rawMessage
     ↓
-dispatchMessage(core, raw)
-    ├── handler registered → core.handlerQ() ← Hop 2a: handlerJob
+dispatchMessage(stream, raw)
+    ├── handler registered → stream.handlerQ() ← Hop 2a: handlerJob
     │       ↓
     │   [handlerLoop (B)]
     │       ↓
     │   handler(streamCtx, msg) → reply
     │
-    └── no handler → core.inboxQ()           ← Hop 2b: rawMessage
+    └── no handler → stream.inboxQ()         ← Hop 2b: rawMessage
             ↓
         Caller's stream.Recv[T]()
 ```
@@ -99,10 +99,11 @@ Same 2-hop structure. recoveryReaderLoop (F) replaces readerLoop (D) and adds:
 
 ## Key Design Properties
 
-- **Decoder is per-stream, spawned on-demand** in `makeStreamLocked()` — not
-  pre-allocated or pooled.
+- **Decoder is per-stream, spawned on-demand** in `startStream()` after the
+  stream is published — not pre-allocated or pooled.
 - **2 channel hops** per message: reader → decoder, decoder → inbox.
 - **Writer is shared** across all streams via `outbound` channel.
-- **Handler goroutine is optional** — only spawned if `registry.hasHandlers()`.
+- **Handler goroutine is optional** — only spawned if the connection snapshot
+  contained handlers when the connection was created.
 - **Recovery preserves the channel structure** — same 2 hops for data, extra
   reader/writer for ACK/seq tracking.

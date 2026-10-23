@@ -124,21 +124,44 @@ Field details:
 
 - `version(1)`: protocol version. Bump this when the header layout or handshake
   semantics change.
-- `flags(1)`: bit flags for per-frame options. Initial bits are reserved; future
-  uses could include compression or control frames.
+- `flags(1)`: independent per-frame bits.
+  - bit 0 `FIN` (`0x01`): last frame for a non-zero stream. The receiver releases
+    that stream after processing the payload. Only the side that opened the
+    stream sends `FIN`. Stream 0 ignores `FIN`.
+  - bit 1 `META` (`0x02`): reserved. A `meta_len(u16)` block follows the fixed header.
+  - bits 2–6: unassigned.
+  - bit 7 `EXT` (`0x80`): reserved. Another flags byte follows the fixed header.
 - `stream_id(u32)`: logical stream identifier within a connection. `0` is the
-  default stream; other values are additional streams.
-- `payload_len(u32)`: payload byte length that follows the header (big endian).
-  - If `FLAG_META` is set, this includes `meta_len + meta_bytes + msg_bytes`.
-  - Otherwise it is just `msg_bytes`.
+  default stream and `0xFFFFFFFF` is reserved for the v3 control stream. The
+  client allocates the other IDs in increasing order starting at 1 and never
+  reuses them within a connection, so a connection can open at most
+  `0xFFFFFFFE` additional streams. A frame for an ID the receiver allocated,
+  whose stream it has already closed, is discarded.
+- `payload_len(u32)`: length of everything after the fixed header (big endian).
+  When present, the parts appear in this order: the `EXT` flags byte, the
+  `META` block (`meta_len + meta_bytes`), then `msg_bytes`. Without `EXT` or
+  `META` it is just `msg_bytes`. Frame boundaries therefore depend only on the
+  fixed header.
+
+Flag rules:
+
+- `FIN` is part of the base protocol. Any other bit may be set only after both
+  peers advertise support for it in the handshake `flags` capability byte.
+- Unassigned bits, and bits not negotiated for the connection, must be 0. A
+  receiver that sees one treats the frame as a protocol error.
+- `META` and `EXT` are not implemented yet, so the current runtimes reject both.
 
 Notes:
 
 - All multi-byte fields are big endian.
 - `payload_len` must be <= `max_frame` from the handshake.
+- A frame with the wrong `version`, unsupported flags, or `payload_len` above
+  `max_frame` is a protocol error, and the receiver closes the connection. In
+  v3 the connection is closed permanently rather than resumed, because resuming
+  would replay the same frame.
 - The payload bytes are encoded using the selected codec mode for that
   connection (compact or map).
-- `flags` are reserved; the current Go runtime ignores them.
+- `FIN` is carried on the normal data path, including v3 sequence numbers and replay.
 
 ### Protocol v3 recovery mode
 
@@ -541,6 +564,7 @@ Current shared vocabulary:
   - `connection.reader`
   - `connection.writer`
   - `connection.reader_enqueue`
+  - `connection.stream_ids_exhausted`
   - `handler.error`
 - recovery path
   - `recovery.resume`
