@@ -112,6 +112,9 @@ Notes:
   will accept. (In the current Go runtime, `max_frame == 0` rejects all non-empty frames.)
 - `max_frame(u32)` in the server reply is the negotiated maximum payload size
   the server will accept (typically `min(client_max, server_max)`).
+- Both runtimes default to 16 MiB on each side. A receiver checks
+  `payload_len` against the negotiated value before allocating the payload, so
+  one frame header cannot make it allocate more.
 - If `accept=0`, the connection should be closed by the server.
 
 ### Frame header (all modes)
@@ -125,9 +128,10 @@ Field details:
 - `version(1)`: protocol version. Bump this when the header layout or handshake
   semantics change.
 - `flags(1)`: independent per-frame bits.
-  - bit 0 `FIN` (`0x01`): last frame for a non-zero stream. The receiver releases
-    that stream after processing the payload. Only the side that opened the
-    stream sends `FIN`. Stream 0 ignores `FIN`.
+  - bit 0 `FIN` (`0x01`): last frame for a non-zero stream. The receiver delivers
+    the stream's earlier frames and this frame's payload, then releases the
+    stream. Only the side that opened the stream sends `FIN`. Stream 0 ignores
+    `FIN`.
   - bit 1 `META` (`0x02`): reserved. A `meta_len(u16)` block follows the fixed header.
   - bits 2–6: unassigned.
   - bit 7 `EXT` (`0x80`): reserved. Another flags byte follows the fixed header.
@@ -136,7 +140,9 @@ Field details:
   client allocates the other IDs in increasing order starting at 1 and never
   reuses them within a connection, so a connection can open at most
   `0xFFFFFFFE` additional streams. A frame for an ID the receiver allocated,
-  whose stream it has already closed, is discarded.
+  whose stream it has already closed, is discarded. A receiver that closes a
+  stream the peer opened likewise discards further frames on it until the
+  peer's `FIN`.
 - `payload_len(u32)`: length of everything after the fixed header (big endian).
   When present, the parts appear in this order: the `EXT` flags byte, the
   `META` block (`meta_len + meta_bytes`), then `msg_bytes`. Without `EXT` or
@@ -162,6 +168,21 @@ Notes:
 - The payload bytes are encoded using the selected codec mode for that
   connection (compact or map).
 - `FIN` is carried on the normal data path, including v3 sequence numbers and replay.
+
+### Connection close
+
+A clean close delivers everything sent before it:
+
+- The closing side stops accepting new messages, writes the frames already
+  queued, then, in v3, a `CLOSE` control frame. It then half-closes the
+  transport and waits for the peer to close its side; the current runtimes
+  wait at most 5 seconds.
+- The receiver treats EOF at a frame boundary (v2) or `CLOSE` (v3) as a clean
+  close: each stream delivers the frames received before it, then the
+  connection closes.
+- Half-closing first matters: closing a socket that still holds unread data
+  makes TCP reset the connection, and the peer then loses the frames it has
+  not read yet.
 
 ### Protocol v3 recovery mode
 
@@ -259,6 +280,18 @@ Current control payloads:
 ```
 [2]
 ```
+
+- CLOSE: `type=3`, 1 byte total
+
+```
+[3]
+```
+
+  Sent by the closing side after its queued data frames. The receiver delivers
+  the frames received before it and closes the logical connection permanently
+  instead of detaching, so the server does not keep it for the detached TTL.
+  Like the other control frames it is not replayed: if it is lost with the
+  transport, the peer detaches as usual.
 
 Current shared heartbeat model:
 

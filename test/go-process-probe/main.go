@@ -60,7 +60,7 @@ func runServer(addr string) {
 }
 
 func runClient(addr string, conns, streamsPerConn, iterations int) {
-	client := am.NewClient().WithTimeout(5 * time.Second)
+	client := am.NewClient().WithConnectTimeout(5 * time.Second)
 	if recoveryEnabled() {
 		client = client.WithRecovery(am.ClientRecoveryOptions{
 			Enable:              true,

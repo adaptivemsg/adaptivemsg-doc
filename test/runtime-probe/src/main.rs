@@ -51,7 +51,7 @@ async fn run_clients(addr: &str, conns: usize, iterations: usize) -> Duration {
     let mut handles = Vec::new();
 
     for _ in 0..conns {
-        let client = Client::new().with_timeout(Duration::from_secs(5));
+        let client = Client::new().with_connect_timeout(Duration::from_secs(5));
         let conn = client.connect(&format!("tcp://{addr}")).await.unwrap();
         conn.set_recv_timeout(Duration::from_secs(5));
         let _: EchoReply = conn.send_recv(EchoReq { text: "warmup".to_string() }).await.unwrap();
@@ -62,7 +62,7 @@ async fn run_clients(addr: &str, conns: usize, iterations: usize) -> Duration {
         handles.push(tokio::spawn(async move {
             barrier.wait().await;
             for _ in 0..ops_per_conn {
-                let res = stream.send_recv::<EchoReq, EchoReply>(EchoReq { text: "x".to_string() }).await;
+                let res = stream.send_recv::<EchoReply>(EchoReq { text: "x".to_string() }).await;
                 match res {
                     Ok(reply) if reply.text == "x" => {}
                     _ => {
@@ -71,7 +71,7 @@ async fn run_clients(addr: &str, conns: usize, iterations: usize) -> Duration {
                     }
                 }
             }
-            conn.close();
+            conn.close().await;
         }));
     }
 

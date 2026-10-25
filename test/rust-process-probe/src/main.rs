@@ -54,7 +54,7 @@ async fn run_client(addr: &str, conns: usize, streams_per_conn: usize, iteration
     let mut all_conns = Vec::with_capacity(conns);
 
     for _ in 0..conns {
-        let mut client = Client::new().with_timeout(Duration::from_secs(5));
+        let mut client = Client::new().with_connect_timeout(Duration::from_secs(5));
         if use_msgpack() {
             client = client.with_codecs(&[CodecMsgpackCompact]);
         }
@@ -78,7 +78,7 @@ async fn run_client(addr: &str, conns: usize, streams_per_conn: usize, iteration
             handles.push(tokio::spawn(async move {
                 barrier.wait().await;
                 for _ in 0..ops_per_stream {
-                    let res = conn.send_recv::<EchoReq, EchoReply>(EchoReq { text: "x".to_string() }).await;
+                    let res = conn.send_recv::<EchoReply>(EchoReq { text: "x".to_string() }).await;
                     match res {
                         Ok(reply) if reply.text == "x" => {}
                         _ => {
@@ -98,7 +98,7 @@ async fn run_client(addr: &str, conns: usize, streams_per_conn: usize, iteration
             handles.push(tokio::spawn(async move {
                 barrier.wait().await;
                 for _ in 0..ops_per_stream {
-                    let res = stream.send_recv::<EchoReq, EchoReply>(EchoReq { text: "x".to_string() }).await;
+                    let res = stream.send_recv::<EchoReply>(EchoReq { text: "x".to_string() }).await;
                     match res {
                         Ok(reply) if reply.text == "x" => {}
                         _ => {
@@ -118,7 +118,7 @@ async fn run_client(addr: &str, conns: usize, streams_per_conn: usize, iteration
     }
     let elapsed = start.elapsed();
     for conn in all_conns {
-        conn.close();
+        conn.close().await;
     }
     if errors.load(Ordering::Relaxed) != 0 {
         panic!("client errors");
