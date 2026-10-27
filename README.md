@@ -109,7 +109,7 @@ Notes:
 - `accept(1)` is 1 for accept, 0 for reject.
 - `flags` are capability bits (reserved for future use).
 - `max_frame(u32)` in the client hello is the maximum payload size the client
-  will accept. (In the current Go runtime, `max_frame == 0` rejects all non-empty frames.)
+  will accept. (In both runtimes, `max_frame == 0` rejects all non-empty frames.)
 - `max_frame(u32)` in the server reply is the negotiated maximum payload size
   the server will accept (typically `min(client_max, server_max)`).
 - Both runtimes default to 16 MiB on each side. A receiver checks
@@ -335,7 +335,9 @@ Initial codecs:
 
 ### Codec selection & shared IDs
 
-- The client sends an ordered preference list; the server picks the first codec it also supports (compact-first by default in current runtimes).
+- The client sends an ordered preference list; the server picks the first codec it also supports.
+- Default lists: Go offers `[compact, map]`; Rust offers `[postcard, compact, map]`. Two Rust
+  peers therefore use postcard, and any connection with a Go peer uses compact.
 - Cross-language interop (go↔rust) requires a shared `CodecID` mapping and matching envelope semantics.
 - Each runtime may support extra codecs, but only shared codecs can be negotiated successfully.
 - Always include a shared fallback codec to avoid no-common-codec failures.
@@ -397,6 +399,17 @@ Notes:
 - Map is larger but more flexible; field order does not matter.
 - The client advertises a preferred codec list; the server picks the first common.
 
+### Byte fields across languages
+
+- Go `[]byte` is MessagePack `bin`. Rust serde writes `Vec<u8>` as an array of
+  integers and cannot read `bin` into it, so declare the Rust field with
+  `#[serde(with = "serde_bytes")]` (`Option<Vec<u8>>` too). For nested bytes use
+  `serde_bytes::ByteBuf` as the element type (`Vec<ByteBuf>`,
+  `BTreeMap<String, ByteBuf>`). `amgen-go` and `amgen-rs` generate these forms.
+- Go `[N]byte` and Rust `[u8; N]` agree in compact mode (both are arrays of
+  integers) but not in map mode, where Go writes `bin`. Use `[]byte` /
+  `Vec<u8>` for byte fields of messages sent with the map codec.
+
 ## Message naming rule
 
 Default name:
@@ -410,7 +423,8 @@ Where:
   The generator does not override it.
 - `module_leaf` is the last segment of the module/package path.
   - Rust: last segment of `module_path!()`.
-  - Go: last directory of the package path.
+  - Go: last directory of the package path, with a trailing `-go` removed
+    (`example.com/echo-go` gives `echo`).
 
 Example:
 
@@ -423,9 +437,14 @@ am.echo.MessageRequest
 Users can provide a stable name override when needed:
 
 - Rust: `#[message(ns = "am", name = "echo.MessageRequest")]`
-- Go: `// am:message ns="am" name="echo.MessageRequest"`
+- Go: implement `WireName() string` on the message type, returning the full
+  name (for example `"am.echo.MessageRequest"`).
 
-If an override is set, it replaces the default.
+If an override is set, it replaces the default. The generators carry
+overrides across: `amgen-rs` turns `#[message(ns, name)]` into a `WireName()`
+method, and `amgen-go` turns a `WireName()` that returns a string literal (or a
+string constant of the same file) into `#[am::message(...)]`. `amgen-go`
+rejects a `WireName()` whose result it cannot read.
 
 ## Code generation (no IDL)
 
@@ -469,7 +488,9 @@ go generate ./...
 `amgen-go` generates three files:
 
 - `api/hello/message.rs` — Rust type definitions (flat, no module wrapper)
-- `lib.rs` — module tree preserving the `api/<service>/` directory structure
+- `lib.rs` — module tree preserving the `api/<service>/` directory structure.
+  It declares every file `amgen-go` has generated in the Go module, one per
+  directory, so packages can be generated in any order.
 - `Cargo.toml` — crate manifest with `[lib] path = "lib.rs"`
 
 It refuses to overwrite an existing `Cargo.toml`. After generation, set the
@@ -517,10 +538,11 @@ hello-server-rust/
 Generate Go types from Rust:
 
 ```
-amgen-rs api/hello/message.rs
+amgen-rs --in api/hello/message.rs
 ```
 
-This generates `api/hello/message.go` alongside the source `.rs` file.
+This generates `api/hello/message.go` alongside the source `.rs` file, and a
+`go.mod` at the crate root if there is none; an existing `go.mod` is left as is.
 
 Go client usage:
 

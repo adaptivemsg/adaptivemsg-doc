@@ -9,12 +9,13 @@ use am::{ClientRecoveryOptions, ServerRecoveryOptions};
 use tokio::net::TcpStream;
 use tokio::sync::Barrier;
 
-#[am::message]
+// The names match the Go probe, so either can serve the other.
+#[am::message(name = "tmp.EchoReq")]
 struct EchoReq {
     text: String,
 }
 
-#[am::message]
+#[am::message(name = "tmp.EchoReply")]
 struct EchoReply {
     text: String,
 }

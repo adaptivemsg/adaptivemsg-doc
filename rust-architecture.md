@@ -4,35 +4,36 @@
 
 All `tokio::spawn` calls in the core runtime:
 
-| #   | Task             | File                     | Scope          | Input Channels                 | Purpose                                     |
-| --- | ---------------- | ------------------------ | -------------- | ------------------------------ | ------------------------------------------- |
-| A   | Decoder          | connection.rs:455        | Per-stream     | `incoming_rx` (Vec\<u8\>)      | Decode envelope, route to handler or inbox  |
-| B   | Handler          | connection.rs:486        | Per-stream     | `handler_rx` (HandlerJob)      | Execute registered handlers, send replies   |
-| C   | Plain Writer     | connection.rs:590        | Per-connection | `outbound_rx`, `writer_cmd_rx` | Write frames to TCP                         |
-| D   | Plain Reader     | connection.rs:625        | Per-transport  | TCP socket                     | Read frames, send raw bytes to decoder      |
-| E   | Recovery Writer  | recovery\_runtime.rs:62  | Per-connection | `live_rx`, `writer_cmd_rx`     | Write frames with seq tracking, ACKs, pings |
-| F   | Recovery Reader  | recovery\_runtime.rs:283 | Per-transport  | TCP socket                     | Read frames with heartbeat timeout          |
-| G   | Server Expiry    | recovery\_runtime.rs:375 | Per-detach     | Timer                          | Close connection after detached\_ttl        |
-| H   | Client Reconnect | recovery\_runtime.rs:408 | Per-client     | Timer                          | Reconnect with exponential backoff          |
-| I   | Server Accept    | server.rs:158            | Per-connection | TCP socket                     | Handshake and connection setup              |
-| J   | User Task        | context.rs:98            | Per-stream     | User closure                   | User-spawned background task                |
+| #   | Task             | Spawned by                                     | Scope          | Input Channels                 | Purpose                                     |
+| --- | ---------------- | ---------------------------------------------- | -------------- | ------------------------------ | ------------------------------------------- |
+| A   | Decoder          | `make_stream()`, connection.rs                 | Per-stream     | `incoming_rx` (Vec\<u8\>)      | Decode envelope, route to handler or inbox  |
+| B   | Handler          | `spawn_handler_task()`, connection.rs          | Per-stream     | `handler_rx` (HandlerJob)      | Execute registered handlers, send replies   |
+| C   | Plain Writer     | `spawn_plain_writer()`, connection.rs          | Per-connection | `outbound_rx`, `writer_cmd_rx` | Write frames to TCP                         |
+| D   | Plain Reader     | `spawn_plain_reader()`, connection.rs          | Per-transport  | TCP socket                     | Read frames, send raw bytes to decoder      |
+| E   | Recovery Writer  | `spawn_recovery_writer()`, recovery\_runtime.rs | Per-connection | `outbound_rx`, `writer_cmd_rx` | Write frames with seq tracking, ACKs, pings |
+| F   | Recovery Reader  | `spawn_recovery_reader()`, recovery\_runtime.rs | Per-transport  | TCP socket                     | Read frames with heartbeat timeout          |
+| G   | Server Expiry    | `spawn_server_expiry()`, recovery\_runtime.rs  | Per-detach     | Timer                          | Close connection after detached\_ttl        |
+| H   | Client Reconnect | `spawn_reconnect_loop()`, recovery\_runtime.rs | Per-client     | Timer                          | Reconnect with exponential backoff          |
+| I   | Server Accept    | `serve_with_accept()`, server.rs               | Per-connection | TCP socket                     | Handshake and connection setup              |
+| J   | User Task        | `new_task()`, context.rs                       | Per-stream     | User closure                   | User-spawned background task                |
 
 ## Channel Definitions
 
-Created in `make_stream()` (connection.rs:424-431):
+Created in `make_stream()`. `queue_size` is 1024 unless
+`with_stream_queue_size` set it on the client or server:
 
 ```rust
 // Hop 1: reader → decoder (raw bytes)
-let (incoming_tx, incoming_rx) = mpsc::channel::<Vec<u8>>(STREAM_QUEUE_SIZE);  // 1024
+let (incoming_tx, incoming_rx) = mpsc::channel::<Vec<u8>>(queue_size);
 
 // Hop 2: decoder → caller (decoded messages)
-let (inbox_tx, inbox_rx) = mpsc::channel::<RawMessage>(STREAM_QUEUE_SIZE);     // 1024
+let (inbox_tx, inbox_rx) = mpsc::channel::<RawMessage>(queue_size);
 
 // Handler path (optional, if handlers registered)
-let (handler_tx, handler_rx) = mpsc::channel::<HandlerJob>(STREAM_QUEUE_SIZE); // 1024
+let (handler_tx, handler_rx) = mpsc::channel::<HandlerJob>(queue_size);
 ```
 
-Created in `new_unstarted()` (connection.rs:194-195):
+Created in `new_unstarted()`:
 
 ```rust
 // All streams → writer

@@ -110,6 +110,12 @@ Probe environment variables:
 - `AM_CODEC=msgpack` — force MsgpackCompact codec (Rust only; Go defaults to it)
 - `AM_RECOVERY=1` — enable V3 recovery mode (both languages)
 
+The two probes use the same wire names, so a Go server can take a Rust client
+and the other way round. To build them against local checkouts instead of the
+published modules, run `go mod edit -replace
+github.com/adaptivemsg/adaptivemsg-go=<path>` in `go-process-probe`, and set
+`adaptivemsg = { path = "<path>" }` in the Rust probe's `Cargo.toml`.
+
 **Files:**
 - Go: `adaptivemsg-go/scaling_bench_test.go`
 - Rust: `adaptivemsg-rust/src/scaling_bench_test.rs`
@@ -504,9 +510,10 @@ works fine across all shapes.
   cache-line transfers and work-stealing overhead. With 4 connections, Rust's
   per-connection throughput drops 2.25× vs 1×1 (at 24 threads); Go's drops
   only 1.16×.
-- **Extra async hops**: Rust's reader → decoder → inbox chain has one more
-  channel crossing per message direction than Go's direct reader → inbox path.
-  Each crossing multiplies the cross-thread penalty.
+- **Channel hops cost more in tokio**: both runtimes pass each message through
+  the same two hops (reader → per-stream decoder → inbox). Under the
+  multi-thread scheduler either hop can wake a task on another worker, so each
+  crossing multiplies the cross-thread penalty.
 
 #### Rust Architectural Bottlenecks
 
@@ -514,8 +521,10 @@ works fine across all shapes.
    through one writer, serializing writes
 2. ~~**One flush per frame**~~ — fixed: V2 plain writer now drains channel
    before flushing (V3 recovery writer already batched ACK+data)
-3. **Extra async hop**: per-stream decoder task between reader and inbox
-   (reader → incoming_tx → decoder → inbox_tx); Go decodes inline
+3. **Decoder hop**: per-stream decoder task between reader and inbox
+   (reader → incoming_tx → decoder → inbox_tx). Go has the same hop
+   (`decodeLoop`), but a tokio cross-thread wake costs more than a goroutine
+   wake
 4. **V3 cross-thread oneshot round-trip** on every send
    (`outbound_tx → writer → oneshot reply`)
 5. **Dynamic dispatch**: `TransportWriter = Box<dyn AsyncWrite>` adds vtable
@@ -598,8 +607,10 @@ uncontended case). Same two hops × two directions = ~400 ns.
 Go: 2,338 B/op, 64 allocs/op. Includes header byte slices (now stack-allocated
 for send/receive), payload buffer, and codec intermediates.
 
-Rust: ~2-3 allocations per frame. Frame headers are stack arrays. Only the
-payload `Vec<u8>` is heap-allocated on receive.
+Rust: frame headers are stack arrays, and postcard decodes straight from the
+payload. The msgpack codecs still build an `rmpv::Value` tree for each body,
+one heap allocation per string, array and map in the message, on top of the
+payload `Vec<u8>` and the wire-name `String`.
 
 **4. Codec reflection**
 
@@ -612,19 +623,28 @@ specialized encode/decode at compile time.
 
 ### Go
 
-| Optimization                                  | Status |
-| --------------------------------------------- | ------ |
-| `bufio.Writer` for all write paths            | ✅ Done |
-| Stack-allocated frame headers                 | ✅ Done |
-| Batched ACK+data writes in V3 recovery writer | ✅ Done |
-| Writer-owned V3 sequencing (correctness fix)  | ✅ Done |
-| Batched-flush V2 writer loop                  | ✅ Done |
+| Optimization                                                    | Status          |
+| --------------------------------------------------------------- | --------------- |
+| `bufio.Writer` for all write paths                              | ✅ Done          |
+| Stack-allocated frame headers                                   | ✅ Done          |
+| Batched ACK+data writes in V3 recovery writer                   | ✅ Done          |
+| Writer-owned V3 sequencing (correctness fix)                    | ✅ Done          |
+| Batched-flush V2 writer loop                                    | ✅ Done          |
+| Buffered reads; V3 writer flushes once per batch                | ✅ Done (2026-10) |
+| Codec carried by the message; lock-free registry snapshot       | ✅ Done (2026-10) |
+| Compact encode written straight to a pooled encoder             | ✅ Done (2026-10) |
+| Compact decode with one streaming decoder; per-type caches      | ✅ Done (2026-10) |
+| Writer-local resume queue; lock-free ACK-due and transport checks | ✅ Done (2026-10) |
 
 ### Rust
 
-| Optimization                       | Status |
-| ---------------------------------- | ------ |
-| Batched-flush V2 plain writer loop | ✅ Done |
+| Optimization                                                    | Status          |
+| --------------------------------------------------------------- | --------------- |
+| Batched-flush V2 plain writer loop                              | ✅ Done          |
+| Buffered reads; V3 writer flushes once per batch                | ✅ Done (2026-10) |
+| Codec carried by the message (no global lock per decode)        | ✅ Done (2026-10) |
+| No deep `Value` clone on decode; fewer copies in envelope/postcard | ✅ Done (2026-10) |
+| Writer-local resume queue; lock-free ACK-due check; reused read timer | ✅ Done (2026-10) |
 
 ### Remaining Opportunities
 
@@ -632,5 +652,59 @@ specialized encode/decode at compile time.
 | ---------------------------------------- | ------------------------------------------- | ---------- |
 | Merge decoder into reader goroutine (Go) | Eliminate 1 channel hop (~1,500 ns/op)      | Medium     |
 | Code-gen msgpack codec (Go)              | Eliminate reflection (~2,000 ns/op)         | Hard       |
-| Writer/reader-owned replay+ACK (Rust)    | Eliminate mutexes, improve scaling          | Hard       |
-| Batch V3 sequencing (Rust)               | Reduce oneshot round-trips, fix V3 overhead | Medium     |
+| Replay buffer without a mutex (both)     | The resume queue and ACK checks no longer lock; the replay buffer is still shared by writer and reader | Hard |
+| Byte-credit V3 backpressure (both)       | Replaces the per-send writer round trip; see the evaluation below | Medium |
+| Zero-copy msgpack body (Rust)            | Skips the `rmpv::Value` tree per message     | Medium     |
+
+## 2026-10 Optimization Round: Before and After
+
+Measured on the same host, the baseline build and the optimized build back to
+back (24 threads, shared machine, load average 2–4). Absolute numbers are
+higher than in the sections above, which were taken on a quieter machine, so
+compare within these tables only.
+
+### Go codec (`BenchmarkCodec*`, 7-field message)
+
+| Benchmark       | Before                       | After                       |
+| --------------- | ---------------------------- | --------------------------- |
+| Encode compact  | 4,570 ns, 1,600 B, 34 allocs | 1,310 ns, 256 B, 7 allocs   |
+| Decode compact  | 10,500 ns, 5,597 B, 104 allocs | 2,200 ns, 784 B, 21 allocs |
+| Encode map      | 1,790 ns, 672 B, 9 allocs    | 1,410 ns, 272 B, 4 allocs   |
+| Decode map      | 4,240 ns, 1,704 B, 27 allocs | 2,950 ns, 645 B, 16 allocs  |
+
+### Single-connection round trip (ns/op, median of 5)
+
+| Benchmark             | Before              | After               |
+| --------------------- | ------------------- | ------------------- |
+| Go V2                 | 91,151 (63 allocs)  | 66,400 (16 allocs)  |
+| Go V3                 | 103,245 (71 allocs) | 81,569 (20 allocs)  |
+| Rust V2 (Postcard)    | 76,996              | 72,083              |
+| Rust V2 (Msgpack)     | 74,132              | 64,592              |
+| Rust V3 (Postcard)    | 79,122              | 67,295              |
+| Rust V3 (Msgpack)     | 78,813              | 61,578              |
+
+### Process-separated probes (ops/sec, Msgpack, median of 3 × 5000 ops)
+
+| Runtime / mode | 1×1           | 1×16           | 4×16             | 4×64             |
+| -------------- | ------------- | -------------- | ---------------- | ---------------- |
+| Go V2          | 8,742 → 11,668 | 50,111 → 79,115 | 93,609 → 147,963 | 108,273 → 122,241 |
+| Go V3          | 7,400 → 8,886  | 32,794 → 70,827 | 75,368 → 102,533 | 78,708 → 101,696  |
+| Rust V2        | 10,764 → 13,908 | 63,333 → 78,244 | 169,880 → 298,418 | 201,823 → 318,432 |
+| Rust V3        | 11,642 → 12,982 | 34,159 → 99,578 | 110,984 → 221,474 | 106,441 → 300,764 |
+
+The in-process scaling benchmarks moved the same way: the largest gains are
+V3 with many streams per connection (Rust 1×64: 36,905 → 256,631 ops/sec; Go
+1×64: 23.4 → 10.3 µs/op), where the per-frame flush and the locks in the V3
+loops cost the most. Go↔Rust probes (each side as server) completed in V2 and
+V3 with every reply checked.
+
+### Deferred: byte-credit backpressure and zero-copy body
+
+On this host the V3 overhead over V2 was +3% to +6% before the round and
+none after it, not the +98% measured for Rust free-run above, so the
+per-send writer round trip that byte credits would remove does not show here.
+The change would rework ordering, held frames and resume in both writers, so
+it waits for a workload where the round trip measurably dominates. The Rust
+zero-copy body saves one small `rmpv::Value` tree per message, well under a
+microsecond next to a round trip of about 65 µs that is dominated by task
+scheduling.
